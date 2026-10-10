@@ -1,0 +1,3965 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.16">
+  <POU Name="MAIN" Id="{81832343-112e-4f9b-82f5-774ce7357d5e}" SpecialFunc="None">
+    <Declaration><![CDATA[
+PROGRAM MAIN
+VAR
+    // =========================================================
+    // 0. 四轴对象
+    // =========================================================
+    axis1_power : MC_Power;
+    axis1       : AXIS_REF;     // axis1 = BD 电缸
+
+    axis2_power : MC_Power;
+    axis2       : AXIS_REF;     // axis2 = AC 旋转轴
+
+    axis3_power : MC_Power;
+    axis3       : AXIS_REF;     // axis3 = AF，末端俯仰旋转力控轴
+
+    axis4_power : MC_Power;
+    axis4       : AXIS_REF;     // axis4 = 底座回转 yaw 力控轴
+
+    axis1_jog : MC_Jog;
+    axis2_jog : MC_Jog;
+    axis3_jog : MC_Jog;
+    axis4_jog : MC_Jog;
+
+    axis1_jogdone    : BOOL;
+    axis1_jogbusy    : BOOL;
+    axis1_jogerror   : BOOL;
+    axis1_jogerrorid : UDINT;
+
+    axis2_jogdone    : BOOL;
+    axis2_jogbusy    : BOOL;
+    axis2_jogerror   : BOOL;
+    axis2_jogerrorid : UDINT;
+
+    axis3_jogdone    : BOOL;
+    axis3_jogbusy    : BOOL;
+    axis3_jogerror   : BOOL;
+    axis3_jogerrorid : UDINT;
+
+    axis4_jogdone    : BOOL;
+    axis4_jogbusy    : BOOL;
+    axis4_jogerror   : BOOL;
+    axis4_jogerrorid : UDINT;
+
+    axis1stop : MC_Stop;
+    axis2stop : MC_Stop;
+    axis3stop : MC_Stop;
+    axis4stop : MC_Stop;
+
+    // 急停恢复后清轴错误用。
+    // 典型用于清除按急停导致的 0x4260 / Controller Enable lost。
+    axis1_reset : MC_Reset;
+    axis2_reset : MC_Reset;
+    axis3_reset : MC_Reset;
+    axis4_reset : MC_Reset;
+
+
+    // =========================================================
+    // 1. 手动按钮输入
+    // =========================================================
+    bInput_axis1jogfw AT %I* : BOOL;
+    bInput_axis1jogbw AT %I* : BOOL;
+
+    bInput_axis2jogfw AT %I* : BOOL;
+    bInput_axis2jogbw AT %I* : BOOL;
+
+    bInput_axis3jogfw AT %I* : BOOL;
+    bInput_axis3jogbw AT %I* : BOOL;
+
+    bInput_axis4jogfw AT %I* : BOOL;
+    bInput_axis4jogbw AT %I* : BOOL;
+
+    bInput_ForceMode AT %I* : BOOL;    // TRUE：进入 AC/BD 力控
+    bInput_ZeroForce AT %I* : BOOL;    // TRUE 上升沿：力传感器清零
+
+    jitingjudge AT %I* : BOOL;         // TRUE 正常，FALSE 急停/停止
+
+
+    // =========================================================
+    // 2. 输出
+    // =========================================================
+    axis1baozha AT %Q* : BOOL;
+    axis4baozha AT %Q* : BOOL;
+
+    valvejudge AT %I* : BOOL;
+    valveopen1 AT %Q* : BOOL;
+    valveopen2 AT %Q* : BOOL;
+
+    bOutput_axis1light AT %Q* : BOOL;
+    bOutput_axis2light AT %Q* : BOOL;
+    bOutput_axis3light AT %Q* : BOOL;
+    bOutput_axis4light AT %Q* : BOOL;
+
+    valvelight AT %Q* : BOOL;
+    likonglight AT %Q* : BOOL;
+
+    // =========================================================
+    // 3. 模式与边沿
+    // =========================================================
+    bManualMode : BOOL := TRUE;
+    bForceMode  : BOOL := FALSE;
+
+    bForceModeOld : BOOL := FALSE;
+    bForceRise    : BOOL := FALSE;
+    bForceFall    : BOOL := FALSE;
+
+    bZeroOld  : BOOL := FALSE;
+    bZeroRise : BOOL := FALSE;
+
+    bRunForce : BOOL := FALSE;
+    bZeroDone : BOOL := FALSE;
+
+
+    // =========================================================
+    // 3A. 轴1 BD 电缸抱闸控制
+    // axis1baozha 是发给继电器的信号：
+    // TRUE  -> 继电器吸合，抱闸松开；
+    // FALSE -> 继电器断开，抱闸合上。
+    // 逻辑：轴1真实使能成功后释放抱闸；断开使能、急停、轴1异常时立即抱闸；
+    // 抱闸释放后延时 300 ms，再允许轴1 Jog / 力控运动。
+    // =========================================================
+    bAxis1PowerEnable : BOOL := TRUE;              // 轴1软件使能允许；FALSE = 主动断开轴1使能
+
+    Axis1_EnableOK_ForBrake : BOOL := FALSE;       // 轴1真实使能成功，来自 axis1_power.Status
+    Axis1_FaultForBrake     : BOOL := FALSE;       // 轴1抱闸用故障综合
+    Axis1_BrakeReleaseReq   : BOOL := FALSE;       // 抱闸释放请求
+    Axis1_BrakeReleased     : BOOL := FALSE;       // 抱闸释放完成，软件判定
+    Axis1_BrakeMotionOK     : BOOL := FALSE;       // 抱闸释放延时到，允许轴1运动
+
+    tonAxis1BrakeReleaseDelay  : TON;
+    Axis1BrakeReleaseDelayTime : TIME := T#300MS;
+
+    // 急停重入互锁：
+    // 急停按下后，即使 bInput_ForceMode 仍保持 TRUE，
+    // 松开急停也不允许自动重新进入力控，从而避免 bForceRise 自动重新清零。
+    // 必须先松开力控开关，再重新按入力控。
+    bForceRearmRequired : BOOL := FALSE;
+
+    // =========================================================
+    // 3B. 急停 / 轴错误恢复 / 力控重新进入管理
+    // jitingjudge：TRUE=安全正常，FALSE=急停/停止。
+    // =========================================================
+    bEStopActive : BOOL := FALSE;          // TRUE = 急停按下
+    bEStopLast : BOOL := FALSE;
+    bEStopRise : BOOL := FALSE;            // 急停刚按下
+    bEStopFall : BOOL := FALSE;            // 急停刚松开
+
+    bSafetyOK : BOOL := FALSE;
+    bAxesPowerOK : BOOL := FALSE;
+    bAxesNoError : BOOL := FALSE;
+    bAxesReadyForForce : BOOL := FALSE;
+
+    bNeedAxisReset : BOOL := FALSE;        // 急停恢复后或轴报错后请求 MC_Reset
+    bAxisResetExecute : BOOL := FALSE;
+    bAxisResetBusyAny : BOOL := FALSE;
+    bAxisResetErrorAny : BOOL := FALSE;
+
+    bForceRequest : BOOL := FALSE;         // 按钮 + 安全条件后的力控请求
+    bAfterEStopInitDone : BOOL := FALSE;   // 急停恢复后目标位置已对齐标志，仅用于 Watch
+
+
+    // =========================================================
+    // 4. 手动 Jog 允许标志
+    // =========================================================
+    ballow_axis1jogfw : BOOL := FALSE;
+    ballow_axis1jogbw : BOOL := FALSE;
+
+    ballow_axis2jogfw : BOOL := FALSE;
+    ballow_axis2jogbw : BOOL := FALSE;
+
+    ballow_axis3jogfw : BOOL := FALSE;
+    ballow_axis3jogbw : BOOL := FALSE;
+
+    ballow_axis4jogfw : BOOL := FALSE;
+    ballow_axis4jogbw : BOOL := FALSE;
+
+    baxis1fwflag1 : BOOL := FALSE;
+    baxis1bwflag1 : BOOL := FALSE;
+
+
+    // =========================================================
+    // 5. 六维力传感器输入
+    // Link 时按传感器原始通道一一对应
+    // =========================================================
+    FT_FxRaw_DINT AT %I* : DINT;
+    FT_FyRaw_DINT AT %I* : DINT;
+    FT_FzRaw_DINT AT %I* : DINT;
+    FT_MxRaw_DINT AT %I* : DINT;
+    FT_MyRaw_DINT AT %I* : DINT;
+    FT_MzRaw_DINT AT %I* : DINT;
+
+    Scale_F_N : LREAL := 0.001;
+    Scale_M_Nm : LREAL := 0.001;       // 力矩比例，按传感器实际比例修改
+
+    Dir_Fx : LREAL := 1.0;
+    Dir_Fy : LREAL := 1.0;
+    Dir_Fz : LREAL := 1.0;
+    Dir_Mx : LREAL := 1.0;
+    Dir_My : LREAL := 1.0;
+    Dir_Mz : LREAL := 1.0;             // Mz 方向反了改成 -1
+
+    Fx_raw_N  : LREAL := 0.0;
+    Fy_raw_N  : LREAL := 0.0;
+    Fz_raw_N  : LREAL := 0.0;
+    Mx_raw_Nm : LREAL := 0.0;
+    My_raw_Nm : LREAL := 0.0;
+    Mz_raw_Nm : LREAL := 0.0;
+
+    bFx_N  : LREAL := 0.0;
+    bFy_N  : LREAL := 0.0;
+    bFz_N  : LREAL := 0.0;
+    bMx_Nm : LREAL := 0.0;
+    bMy_Nm : LREAL := 0.0;
+    bMz_Nm : LREAL := 0.0;
+
+    // =========================================================
+    // 5A. AF 姿态、总空载偏置模型、力/力矩坐标变换参数
+    // =========================================================
+    // 正确处理顺序：
+    // 1) 读取传感器原始六维数据；
+    // 2) 在传感器坐标系 S 内减去“总空载偏置拟合模型”；
+    // 3) 再减去在线残余零偏 bFx/bFy/bMx...；
+    // 4) 得到 Fhuman_S / Mhuman_S；
+    // 5) 再做坐标变换：
+    //      Fhuman_S_X/Y -> 机构 X/Z 平面力控；
+    //      Mhuman_S_Z   -> AF 俯仰；
+    //      Mhuman_S_X/Y 扣除 Ph×F 后 -> 根据 AF 姿态组合为底座 yaw 纯扭矩。
+    //
+    // 当前坐标确认：
+    // Xs≈-ZB，Ys≈+XB，Zs≈+YB。
+    // 重新拆装后：AF=113° 近似竖直，AF=203° 水平。
+    // 本版按最新确认：AF=70 时末端俯仰约 135°，因此 q=AF-115=-45°。
+    // =========================================================
+    bUseHandleBiasModel : BOOL := TRUE;       // TRUE：使用总空载偏置拟合模型
+    bUseAngleFitBiasModel : BOOL := TRUE;     // TRUE：启用 AF 角度相关总偏置模型
+    bUseAFForForceMap   : BOOL := TRUE;       // TRUE：力方向随 AF 姿态变换；调方向时可临时 FALSE
+
+    AF_HorizontalEnc_deg : LREAL := 202.3;    // 末端吸盘水平
+    AF_VerticalEnc_deg   : LREAL := 112.3;    // 末端吸盘竖直；此姿态 yaw 力矩主要为 Tx
+
+    // 总偏置拟合角：以 AF=112.3° 竖直姿态为 0°，AF=202.3° 水平姿态为 +90°。
+    AF_BiasRel_deg : LREAL := 0.0;
+    AF_BiasRel_rad : LREAL := 0.0;
+    cAF_Bias : LREAL := 1.0;
+    sAF_Bias : LREAL := 0.0;
+
+    // AC/BD 平面力方向变换角：同样以 AF=112.3° 为零位
+    AF_ForceRefEnc_deg : LREAL := 112.3;
+    AF_ForceRel_deg : LREAL := 0.0;
+    AF_ForceRel_rad : LREAL := 0.0;
+    cAF_Force : LREAL := 1.0;
+    sAF_Force : LREAL := 0.0;
+
+    // 底座 yaw 力矩轴变换角：112.3 时 yaw≈Tx；203° 时 yaw≈Ty
+    AF_YawRefEnc_deg : LREAL := 112.3;
+    YawAngleGain : LREAL := 1.0;              // 底座 yaw 力矩按 AF 姿态由 Mx/My 共同分解到基坐标 Z 轴
+    YawMomentOffset_deg : LREAL := 0.0;       // Tx/Ty 混合相位微调
+    YawMomentAngle_deg : LREAL := 0.0;
+    YawMomentAngle_rad : LREAL := 0.0;
+    cYawAxis : LREAL := 1.0;
+    sYawAxis : LREAL := 0.0;
+    YawMixSign : LREAL := 1.0;                // 若水平时 Ty 对 yaw 方向反，改成 -1；整体方向反改 Dir_Mx_Yaw
+
+    // AF 理论姿态角，仅用于监控/后续理论分析，不参与 AC/BD 机构正解
+    // ToolPitch=0 表示吸盘水平；ToolPitch=90 表示吸盘竖直。
+    AF_ToolPitch_deg : LREAL := 0.0;
+    AF_MechOffset_deg : LREAL := 104.48;      // 机构平面 +X 到末端工具方向的固定偏角，仅监控
+    AF_MechAngle_deg : LREAL := 0.0;
+
+    ArmDev_deg : LREAL := 0.0;
+    YawDev_deg : LREAL := 0.0;
+
+    // 平面方向符号调试项：若末端运动方向整体反了，只改这里，不改传感器原始方向
+    Dir_FxPlane : LREAL := 1.0;
+    Dir_FzPlane : LREAL := 1.0;
+
+    // 把手物理参数：当前仅用于理论监控 Fg/Mg，不再叠加进 bias
+    HandleMass_kg : LREAL := 0.82;
+    Gravity_mps2 : LREAL := 9.80665;
+    HandleWeight_N : LREAL := 0.0;
+
+    // 重心位于把手中轴线，距把手底座 54 mm；按传感器 Zs 正方向建模
+    HandleCG_x_m : LREAL := 0.0;
+    HandleCG_y_m : LREAL := 0.0;
+    HandleCG_z_m : LREAL := 0.054;
+
+    // 人手作用点位于把手中轴线，距把手底座 110 mm；用于 Ph×F 力臂解耦
+    HandleForce_x_m : LREAL := 0.0;
+    HandleForce_y_m : LREAL := 0.0;
+    HandleForce_z_m : LREAL := 0.110;
+
+    // 把手物理重力理论监控量，不参与 Fx_bias/Mx_bias
+    Fg_S_X_N : LREAL := 0.0;
+    Fg_S_Y_N : LREAL := 0.0;
+    Fg_S_Z_N : LREAL := 0.0;
+
+    Mg_S_X_Nm : LREAL := 0.0;
+    Mg_S_Y_Nm : LREAL := 0.0;
+    Mg_S_Z_Nm : LREAL := 0.0;
+
+    // 总空载偏置模型中间量：
+    // 注意：这些变量名沿用 res_ang，但现在含义是“总空载拟合偏置”，不是物理重力之外的残差。
+    Fx_res_ang_N  : LREAL := 0.0;
+    Fy_res_ang_N  : LREAL := 0.0;
+    Fz_res_ang_N  : LREAL := 0.0;
+    Mx_res_ang_Nm : LREAL := 0.0;
+    My_res_ang_Nm : LREAL := 0.0;
+    Mz_res_ang_Nm : LREAL := 0.0;
+
+    Fx_bias_N  : LREAL := 0.0;
+    Fy_bias_N  : LREAL := 0.0;
+    Fz_bias_N  : LREAL := 0.0;
+    Mx_bias_Nm : LREAL := 0.0;
+    My_bias_Nm : LREAL := 0.0;
+    Mz_bias_Nm : LREAL := 0.0;
+
+    // raw - bias 后的中间量，用于清零与 Watch 判断
+    Fx_afterBias_N  : LREAL := 0.0;
+    Fy_afterBias_N  : LREAL := 0.0;
+    Fz_afterBias_N  : LREAL := 0.0;
+    Mx_afterBias_Nm : LREAL := 0.0;
+    My_afterBias_Nm : LREAL := 0.0;
+    Mz_afterBias_Nm : LREAL := 0.0;
+
+    // 扣除总偏置和在线零偏后的人手力/力矩，仍在传感器坐标系 S 下
+    Fhuman_S_X : LREAL := 0.0;
+    Fhuman_S_Y : LREAL := 0.0;
+    Fhuman_S_Z : LREAL := 0.0;
+    Mhuman_S_X : LREAL := 0.0;
+    Mhuman_S_Y : LREAL := 0.0;
+    Mhuman_S_Z : LREAL := 0.0;
+
+    // 力通道中间变量：当前不做 Mx/Mz 到 Fx/Fy/Fz 的串扰补偿
+    Fdec_S_X : LREAL := 0.0;
+    Fdec_S_Y : LREAL := 0.0;
+    Fdec_S_Z : LREAL := 0.0;
+
+    // yaw / AF 控制用力矩
+    MAF_raw_Nm : LREAL := 0.0;       // AF 俯仰原始意图：Mhuman_S_Z
+    Myaw_raw_Nm : LREAL := 0.0;      // yaw 实际进入滤波/死区的输入，已经经过平移污染软扣除
+    Myaw_raw_beforeGate_Nm : LREAL := 0.0;   // 仅 Watch：Mx/My 投影到基坐标 Z 轴后的原始 yaw 力矩
+    Myaw_gate_Nm : LREAL := 0.0;             // 经过平移污染软扣除后的 yaw 输入
+
+    Myaw_filt_Nm : LREAL := 0.0;
+    Myaw_work_Nm : LREAL := 0.0;
+
+    // =========================================================
+    // Zs 通道替代底座 yaw 控制：模拟末端第 3 个平移自由度
+    // 说明：
+    // 1) Fhuman_S_Z 是 raw-bias-zero 后的传感器 Zs 方向人手力。
+    // 2) raw Fz 空载在 37~39N 属于预紧/安装偏置，不直接进入控制；
+    //    进入力控或手动清零时 bFz_N 会记录当前残差，使 Fhuman_S_Z 归零。
+    // 3) 平面直推会污染 Zs 通道，因此先用 Fhuman_S_X/Y 估计并扣除这部分污染，
+    //    再用剩余 FzYaw_work_N 作为底座 yaw 的虚拟输入。
+    // =========================================================
+    bUseFzChannelForYaw : BOOL := TRUE;       // TRUE：yaw 使用 Fhuman_S_Z；FALSE：保留 Mx/My 投影方案
+
+    FzYaw_raw_N : LREAL := 0.0;               // 原始 Zs 人手力，等于 Fhuman_S_Z
+    FzYaw_rawFilt_N : LREAL := 0.0;           // 与平面力同步的一阶滤波 Zs 力
+    FzYaw_transMag_N : LREAL := 0.0;          // 平面直推强度，使用死区前 Fhuman_S_X/Y
+    FzYaw_transIntent : LREAL := 0.0;         // 0~1，平移意图强度
+    FzYawTransStart_N : LREAL := 2.0;         // 平面力超过该值开始认为会污染 Zs
+    FzYawTransFull_N : LREAL := 10.0;         // 平面力超过该值认为污染权重满
+
+    // Zs 污染模型：
+    // Fz_pollution = Kx*Fx + Ky*Fy + KabsX*ABS(Fx) + KabsY*ABS(Fy) + Kmag*SQRT(Fx^2+Fy^2)
+    // 若直推正反方向导致 Fz 正负变化，用 Kx/Ky；
+    // 若直推正反方向都使 Fz 同方向变化，用 KabsX/KabsY/Kmag。
+    FzYawKx : LREAL := 0.0;
+    FzYawKy : LREAL := 0.0;
+    FzYawKabsX : LREAL := 0.0;
+    FzYawKabsY : LREAL := 0.0;
+    FzYawKmag : LREAL := 0.0;
+
+    FzYaw_pollutionEst_N : LREAL := 0.0;      // 由平移意图估计出来的 Zs 污染力
+    FzYawCompRatio : LREAL := 0.70;           // 0=不扣，1=全扣；模型不完全准时建议 0.60~0.80，不建议长期满补偿
+    FzYaw_afterComp_N : LREAL := 0.0;         // 扣除平移污染后的 Zs 力
+
+    // 模型未完全准确时，保留一个软衰减：平面直推越明显，Zs 剩余量越保守。
+    // 注意：该项会削弱“平移+Zs/yaw 同时操作”的 Zs 响应，先取 0.30~0.50。
+    FzYawSoftRejectRatio : LREAL := 0.0;
+    FzYaw_softScale : LREAL := 1.0;
+    FzYaw_clean_N : LREAL := 0.0;
+
+    FzYaw_filt_N : LREAL := 0.0;
+    FzYaw_work_N : LREAL := 0.0;
+    FzYawDead_N : LREAL := 2.0;               // 保留旧固定死区变量，仅用于兼容 Watch；实际使用 FzYawDeadDyn_N
+
+    // 模型补偿 + 动态死区：平面 X/Y 力越大，Zs 控 yaw 的死区越大
+    FzYawCandidate_N : LREAL := 0.0;          // 同级滤波的 Zs 力减去平面串扰估计
+    FzYawDeadBase_N : LREAL := 2.0;           // 无明显平面力时的 Zs/yaw 基础死区
+    FzYawDeadPerPlane : LREAL := 0.35;        // 每 1N 平面力增加的 Zs/yaw 死区，建议 0.30~0.55
+    FzYawDeadMax_N : LREAL := 10.0;           // 动态死区上限，防止平移时永远无法 Zs/yaw
+    FzYawDeadDyn_N : LREAL := 2.0;            // 实时动态死区
+    FzYawToYaw_NmPerN : LREAL := 1.0;         // 把 Zs 力换算成 yaw 虚拟力矩输入，1N -> 1 pseudo Nm
+    Dir_FzYaw : LREAL := 1.0;                 // Zs 控制 yaw 方向反了改 -1
+
+
+    // =========================================================
+    // Fz 通道 yaw：AF 姿态相关平移污染补偿模型
+    // 目的：用 Fx_filt/Fz_filt 估计平面直推对 Fhuman_S_Z 的污染，
+    //      并根据 AF=115 竖直、AF=205 水平进行系数插值。
+    // 注意：这里不再使用固定大 Bias，也不再把污染项限制为正值。
+    // =========================================================
+    AF_BlendPoll : LREAL := 0.0;              // 0=AF竖直115，1=AF水平205
+
+    FzPollIn_X_N : LREAL := 0.0;              // 污染模型输入 X，建议使用 Fx_filt
+    FzPollIn_Z_N : LREAL := 0.0;              // 污染模型输入 Z，建议使用 Fz_filt
+    FzPollMag_N : LREAL := 0.0;               // 平面力强度
+    FzPollIntent : LREAL := 0.0;              // 0~1，平面力强度监控；不参与补偿比例
+
+    FzPollStart_N : LREAL := 1.0;             // 平面强度监控渐入起点（不控制补偿开关）
+    FzPollFull_N : LREAL := 5.0;              // 平面强度监控满量点（不控制补偿开关）
+
+    // 竖直状态 AF=115 系数，来自本轮竖直截图的临时拟合
+    Kx_Vertical : LREAL := 0.029;
+    Kz_Vertical : LREAL := -0.117;
+    KabsX_Vertical : LREAL := 0.130;
+    KabsZ_Vertical : LREAL := 0.007;
+
+    // 水平状态 AF=205 系数，来自本轮水平截图的临时拟合
+    Kx_Horizontal : LREAL := 0.054;
+    Kz_Horizontal : LREAL := 0.062;
+    KabsX_Horizontal : LREAL := 0.319;
+    KabsZ_Horizontal : LREAL := 0.026;
+
+    // 当前 AF 插值后的污染系数
+    Kx_AF : LREAL := 0.0;
+    Kz_AF : LREAL := 0.0;
+    KabsX_AF : LREAL := 0.0;
+    KabsZ_AF : LREAL := 0.0;
+
+    FzYawPollRaw_N : LREAL := 0.0;            // 模型估计的 Zs 污染，允许正负
+    FzYawPollUsed_N : LREAL := 0.0;           // 实际扣除的污染量
+
+    // 速度显示修正：限幅前/限幅后 E 点合速度
+    Vnorm_PreLimit_mps : LREAL := 0.0;
+    Vnorm_AfterLimit_mps : LREAL := 0.0;
+    ScaleVel_Plane : LREAL := 1.0;
+    ScaleVel_Axis : LREAL := 1.0;
+    ScaleAcc_Axis : LREAL := 1.0;
+
+    // yaw 力矩坐标变换：
+    // Mx_yaw_use_Nm / My_yaw_use_Nm 是扣除 Ph×F 后的传感器坐标系纯扭矩分量。
+    // Myaw_parallel_Nm 是其投影到基坐标 Z 轴 / 底座 yaw 轴的分量。
+    // Myaw_perp_Nm 只作为 Watch 监控，不再作为硬屏蔽条件，避免同时平移+旋转时误杀真正 yaw 意图。
+    Myaw_parallel_Nm : LREAL := 0.0;
+    Myaw_perp_Nm : LREAL := 0.0;
+    Myaw_absParallel_Nm : LREAL := 0.0;
+    Myaw_absPerp_Nm : LREAL := 0.0;
+    Myaw_axisErrRatio : LREAL := 0.0;
+    YawAlignLimit_Nm : LREAL := 0.0;
+    bYawAxisAligned : BOOL := FALSE;
+    bUseYawAxisAlignGate : BOOL := FALSE;     // 本版不再用轴向一致性硬屏蔽 yaw，仅用于 Watch
+    YawPerpBase_Nm : LREAL := 0.30;
+    YawPerpRatio : LREAL := 0.25;
+
+    // yaw 平移污染软扣除：
+    // 平移力越大，允许被视为平移污染的 yaw 分量越大。
+    // 不再二值屏蔽，而是从 Myaw_parallel_Nm 中扣掉一个污染包络，保留超出部分给 yaw。
+    bUseYawTransBlock : BOOL := TRUE;
+    FtransMag_N : LREAL := 0.0;
+    FTransStrong_N : LREAL := 0.0;             // 保留旧变量名；本版不再用它做二值门控
+    YawTransBlockBase_Nm : LREAL := 0.80;
+    YawTransBlockPerN : LREAL := 1.20;
+    YawTransBlockLimit_Nm : LREAL := 0.0;      // 等价于平移污染估计包络
+    YawTransBlockMax_Nm : LREAL := 18.0;
+    Myaw_absRaw_Nm : LREAL := 0.0;
+    Myaw_transResidual_Nm : LREAL := 0.0;
+    Myaw_gateSign : LREAL := 1.0;
+    bYawBlockedByTrans : BOOL := FALSE;        // TRUE 表示本周期 yaw 被平移污染包络完全吃掉
+
+    // yaw 动态死区：本版主要靠平移污染软扣除，动态死区只保留小幅增量，避免双重压死 yaw。
+    MDead_Yaw_Base : LREAL := 0.80;
+    MDead_Yaw_PerN : LREAL := 0.05;
+    MDead_Yaw_Max : LREAL := 2.50;
+    MDead_Yaw_Dyn : LREAL := 0.80;
+
+    // 人手作用点力臂：力作用点在传感器 Zs 正方向 110 mm
+    Ph_x_m : LREAL := 0.0;
+    Ph_y_m : LREAL := 0.0;
+    Ph_z_m : LREAL := 0.110;
+
+    Mx_lever_Nm : LREAL := 0.0;      // Ph×F 产生的 Mx
+    My_lever_Nm : LREAL := 0.0;      // Ph×F 产生的 My
+    Mz_lever_Nm : LREAL := 0.0;      // Ph×F 产生的 Mz
+
+    Mx_pure_Nm : LREAL := 0.0;       // Mhuman_S_X - Mx_lever_Nm
+    My_pure_Nm : LREAL := 0.0;       // Mhuman_S_Y - My_lever_Nm
+    Mz_pure_Nm : LREAL := 0.0;       // Mhuman_S_Z - Mz_lever_Nm
+
+    // yaw 力臂解耦比例：
+    // 1.0 = 完全纯扭矩控制；0.0 = 不扣 Ph×F；0.2~0.5 = 部分扣除
+    YawLeverCompRatio : LREAL := 1.0;
+    Mx_yaw_use_Nm : LREAL := 0.0;
+    My_yaw_use_Nm : LREAL := 0.0;
+
+    bUseFzForMxLever : BOOL := FALSE;
+    Fz_for_lever_N : LREAL := 0.0;
+
+    Fx_ext_N     : LREAL := 0.0;    // 机构 X 向力
+    Fz_ext_N     : LREAL := 0.0;    // 机构 Z 向力
+    Fy_lateral_N : LREAL := 0.0;    // 机构 Y 向力，当前只监控
+
+    Fx_filt : LREAL := 0.0;
+    Fz_filt : LREAL := 0.0;
+    Mx_filt : LREAL := 0.0;
+    Mz_filt : LREAL := 0.0;
+
+    Fx_work : LREAL := 0.0;
+    Fz_work : LREAL := 0.0;
+    Mx_work_Nm : LREAL := 0.0;
+    Mz_work_Nm : LREAL := 0.0;
+
+    Alpha   : LREAL := 0.10;
+
+    // =========================================================
+    // AC/BD 平面软死区
+    // 目的：完整扣除启动死区，避免进入后残余力维持运动。
+    // FDead_X/Z 保留为名义启动死区监控量，不再用于直接硬扣除。
+    // =========================================================
+    FDead_X : LREAL := 3.0;
+    FDead_Z : LREAL := 3.0;
+
+    FIntentEnter_X_N : LREAL := 3.2;
+    FIntentEnter_Z_N : LREAL := 3.2;
+    FIntentExit_X_N  : LREAL := 2.0;
+    FIntentExit_Z_N  : LREAL := 2.0;
+
+    FDeadSub_X_N : LREAL := 3.2;
+    FDeadSub_Z_N : LREAL := 3.2;
+    // 实际死区至少等于启动阈值，防止在线调参再次缩小扣除量。
+    FDeadSubUse_X_N : LREAL := 3.2;
+    FDeadSubUse_Z_N : LREAL := 3.2;
+    bXDriveActive : BOOL := FALSE;   // 本周期存在超过完整死区的有效平面力
+    bZDriveActive : BOOL := FALSE;
+
+    bXIntent : BOOL := FALSE;
+    bZIntent : BOOL := FALSE;
+
+    Fx_abs_N : LREAL := 0.0;
+    Fz_abs_N : LREAL := 0.0;
+
+    Fx_work_target : LREAL := 0.0;
+    Fz_work_target : LREAL := 0.0;
+
+    WorkFiltAlpha_X : LREAL := 0.25;
+    WorkFiltAlpha_Z : LREAL := 0.25;
+
+    MDead_Z : LREAL := 0.15;            // AF 俯仰 Tz/Mz 死区
+    MDead_Yaw : LREAL := 1.2;           // 底座 yaw 纯扭矩死区；本版实际使用 MDead_Yaw_Dyn
+
+    ForceGain_X : LREAL := 0.15;
+    ForceGain_Z : LREAL := 0.15;
+    TorqueGain_Yaw : LREAL := 0.20;     // yaw 增益：Zs/yaw 输入到导纳速度的比例，当前按要求设 0.20
+    TorqueGain_AF  : LREAL := 42.0;     // Tz/Mz -> AF 俯仰导纳输入增益；按你当前调试值保留为 42
+
+    // yaw / pitch 意图下平移通道软衰减：不禁用 AC/BD，只降低回转/俯仰时 Fx/Fz 对平动的影响
+    YawIntent : LREAL := 0.0;
+    PitchIntent : LREAL := 0.0;
+    RotIntent : LREAL := 0.0;
+    TransWeight_X : LREAL := 1.0;
+    TransWeight_Z : LREAL := 1.0;
+    MzSoftStart_Nm : LREAL := 0.20;     // Tz/Mz 超过该值开始认为有 AF 俯仰意图
+    MzSoftFull_Nm  : LREAL := 0.60;     // Tz/Mz 超过该值平移权重降到最小
+    MxSoftStart_Nm : LREAL := 1.2;      // yaw work 超过该值开始认为有底座 yaw 意图
+    MxSoftFull_Nm  : LREAL := 2.8;      // yaw work 超过该值平移权重降到最小
+    TransWeightMin_X : LREAL := 0.70;   // 旋转明显时，X 平移至少保留 70%
+    TransWeightMin_Z : LREAL := 0.50;   // 旋转明显时，Z 平移至少保留 50%
+
+
+    // =========================================================
+    // 6. 外部位置给定
+    // axis1=BD、axis2=AC 做 X/Z 平面力控
+    // axis3=AF 俯仰，用 Tz/Mz 做旋转导纳；axis4=底座 yaw，用 Tx/Mx 做旋转导纳
+    // =========================================================
+    fbExtEnableBD  : MC_ExtSetPointGenEnable;
+    fbExtEnableAC  : MC_ExtSetPointGenEnable;
+    fbExtEnableAF  : MC_ExtSetPointGenEnable;
+    fbExtEnableYaw : MC_ExtSetPointGenEnable;
+
+    fbExtDisableBD  : MC_ExtSetPointGenDisable;
+    fbExtDisableAC  : MC_ExtSetPointGenDisable;
+    fbExtDisableAF  : MC_ExtSetPointGenDisable;
+    fbExtDisableYaw : MC_ExtSetPointGenDisable;
+
+    stExtOpt : ST_ExtSetPointEnableOptions;
+
+    bExtBD  : BOOL := FALSE;
+    bExtAC  : BOOL := FALSE;
+    bExtAF  : BOOL := FALSE;
+    bExtYaw : BOOL := FALSE;
+
+    bFeedBD  : BOOL := FALSE;
+    bFeedAC  : BOOL := FALSE;
+    bFeedAF  : BOOL := FALSE;
+    bFeedYaw : BOOL := FALSE;
+
+
+    // =========================================================
+    // 7. 编码器实际值、外部目标值
+    // =========================================================
+    BD_ActEnc : LREAL := 0.0;       // axis1 实际值，单位 mm
+    AC_ActEnc : LREAL := 0.0;       // axis2 实际值，单位 deg 或当前 NC 单位
+    AF_ActEnc : LREAL := 0.0;       // axis3 AF 实际值
+    Yaw_ActEnc : LREAL := 0.0;      // axis4 底座回转实际值，单位 deg 或当前 NC 单位
+
+    // AF 实际速度监控：NC 反馈 + 编码器差分
+    AF_ActVel_NC_enc_s : LREAL := 0.0;
+    AF_ActVel_enc_s : LREAL := 0.0;
+    AF_ActVel_calc_enc_s : LREAL := 0.0;
+    AF_ActEnc_Last : LREAL := 0.0;
+    bAF_ActVelInit : BOOL := FALSE;
+    AF_VelRatio_Calc : LREAL := 0.0;
+    AF_PosLag_Enc : LREAL := 0.0;
+
+    BD_PosCmd_Enc : LREAL := 0.0;   // axis1 外部位置给定，单位 mm
+    AC_PosCmd_Enc : LREAL := 0.0;   // axis2 外部位置给定，单位 deg 或当前 NC 单位
+    AF_PosCmd_Enc : LREAL := 0.0;   // axis3 AF 外部位置给定
+    Yaw_PosCmd_Enc : LREAL := 0.0;  // axis4 外部位置给定
+
+
+    // =========================================================
+    // 8. 最新机构学对应关系
+    //
+    // BD：
+    // 实际 1 mm = 机构学 1 mm = 编码器 1 mm
+    // LBD_mm = BD_ActEnc + BD_KinOffset_mm
+    // 比例固定为 1:1：编码器 1 mm = 实际 1 mm = 机构学 1 mm
+    // 只允许存在固定零点偏置 BD_KinOffset_mm，不允许再使用 0.95 等比例缩放
+    //
+    // AC：
+    // 编码器 -59 对应机构角 90°
+    // 编码器值增大，机构角减小
+    // ThetaAC_deg = 90 - (AC_ActEnc - (-59))
+    // =========================================================
+    BD_KinOffset_mm : LREAL := 1010.0;
+
+    AC_EncRef_deg   : LREAL := -60.5;
+    AC_ThetaRef_deg : LREAL := 90.0;
+
+    ThetaAC_deg : LREAL := 90.0;
+    ThetaAC_rad : LREAL := 0.0;
+
+    LBD_mm : LREAL := 0.0;
+    LBD_m  : LREAL := 0.0;
+
+
+    // =========================================================
+    // 9. 机构几何参数
+    // AC 长度最新为 1.0 m
+    // 其余参数按当前机构实际值核对
+    // =========================================================
+    Ax0 : LREAL := 0.0;
+    Az0 : LREAL := 0.225;
+
+    Bx0 : LREAL := 0.2;
+    Bz0 : LREAL := 0;
+
+    l_AC : LREAL := 1.0;
+    l_CD : LREAL := 1.0;
+    l_CE : LREAL := 1.4;
+
+    D_Offset_m : LREAL := 0.11;     // D 点相对 CE 垂直向下 80 mm
+    CE_Sign    : LREAL := 1.0;      // MATLAB 验证正确则保持 1；若 E 点在另一侧改 -1
+
+    GeoMargin_m : LREAL := 0.005;
+
+    Cx : LREAL := 0.0;
+    Cz : LREAL := 0.0;
+    Dx : LREAL := 0.0;
+    Dz : LREAL := 0.0;
+    Ex : LREAL := 0.0;
+    Ez : LREAL := 0.0;
+
+    dxBC : LREAL := 0.0;
+    dzBC : LREAL := 0.0;
+    dBC  : LREAL := 0.0;
+
+    alphaBC : LREAL := 0.0;
+    cosBeta : LREAL := 0.0;
+    beta    : LREAL := 0.0;
+    thBD    : LREAL := 0.0;
+    theta3  : LREAL := 0.0;          // CD 方向角
+    thetaCE : LREAL := 0.0;          // CE 主杆方向角
+    gamma_DCE : LREAL := 0.0;
+    s_CD_CE : LREAL := 0.0;
+
+    bGeoOK : BOOL := FALSE;
+
+
+    // =========================================================
+    // 10. 数值雅可比扰动
+    // =========================================================
+    dTheta : LREAL := 0.001;   // rad
+    dL     : LREAL := 0.001;   // m
+
+    Cx_th : LREAL := 0.0;
+    Cz_th : LREAL := 0.0;
+    Dx_th : LREAL := 0.0;
+    Dz_th : LREAL := 0.0;
+    Ex_th : LREAL := 0.0;
+    Ez_th : LREAL := 0.0;
+
+    dxBC_th : LREAL := 0.0;
+    dzBC_th : LREAL := 0.0;
+    dBC_th  : LREAL := 0.0;
+
+    alphaBC_th : LREAL := 0.0;
+    cosBeta_th : LREAL := 0.0;
+    beta_th    : LREAL := 0.0;
+    thBD_th    : LREAL := 0.0;
+    theta3_th  : LREAL := 0.0;
+    thetaCE_th : LREAL := 0.0;
+    gamma_DCE_th : LREAL := 0.0;
+    s_CD_CE_th : LREAL := 0.0;
+
+    Cx_L : LREAL := 0.0;
+    Cz_L : LREAL := 0.0;
+    Dx_L : LREAL := 0.0;
+    Dz_L : LREAL := 0.0;
+    Ex_L : LREAL := 0.0;
+    Ez_L : LREAL := 0.0;
+
+    dxBC_L : LREAL := 0.0;
+    dzBC_L : LREAL := 0.0;
+    dBC_L  : LREAL := 0.0;
+
+    alphaBC_L : LREAL := 0.0;
+    cosBeta_L : LREAL := 0.0;
+    beta_L    : LREAL := 0.0;
+    thBD_L    : LREAL := 0.0;
+    theta3_L  : LREAL := 0.0;
+    thetaCE_L : LREAL := 0.0;
+    gamma_DCE_L : LREAL := 0.0;
+    s_CD_CE_L : LREAL := 0.0;
+
+    bGeoOK_th : BOOL := FALSE;
+    bGeoOK_L  : BOOL := FALSE;
+
+    J11  : LREAL := 0.0;   // dEx / dTheta
+    J21  : LREAL := 0.0;   // dEz / dTheta
+    J12  : LREAL := 0.0;   // dEx / dL
+    J22  : LREAL := 0.0;   // dEz / dL
+    detJ : LREAL := 0.0;
+
+    DetMin    : LREAL := 0.0005;
+    bValidJ   : BOOL := FALSE;
+    bSingular : BOOL := FALSE;
+
+
+    // =========================================================
+    // 11. 导纳参数
+    // =========================================================
+    Ts      : LREAL := 0.002;
+    PI      : LREAL := 3.141592653589793;
+    DEG2RAD : LREAL := 0.0174532925199433;
+    RAD2DEG : LREAL := 57.29577951308232;
+
+    AdmM_X : LREAL := 0.40;
+    AdmM_Z : LREAL := 0.40;
+
+    AdmB_Move_X : LREAL := 0.75;      // 提高运动阻尼，降低同样输入力下的稳定速度
+    AdmB_Move_Z : LREAL := 0.75;      // 提高运动阻尼，降低同样输入力下的稳定速度
+
+    AdmB_Stop_X : LREAL := 4.0;      // 撤力时平滑衰减，最终减速度仍受轴限幅约束
+    AdmB_Stop_Z : LREAL := 4.0;      // 撤力时平滑衰减，最终减速度仍受轴限幅约束
+
+    AdmB_Use_X : LREAL := 0.75;
+    AdmB_Use_Z : LREAL := 0.75;
+
+    Fadm_X : LREAL := 0.0;
+    Fadm_Z : LREAL := 0.0;
+
+    Vx_mps      : LREAL := 0.0;
+    Vz_mps      : LREAL := 0.0;
+    Vx_last_mps : LREAL := 0.0;
+    Vz_last_mps : LREAL := 0.0;
+
+    Ax_mps2 : LREAL := 0.0;
+    Az_mps2 : LREAL := 0.0;
+
+    VxyMax_mps : LREAL := 0.300;     // 末端 X-Z 合速度上限：0.300 m/s = 300 mm/s
+
+    Vnorm    : LREAL := 0.0;
+    ScaleVel : LREAL := 1.0;
+    ScaleAcc : LREAL := 1.0;
+    tmpScale : LREAL := 1.0;
+
+    qdotAC_rad_s : LREAL := 0.0;    // 机构 AC 角速度，rad/s
+    qdotBD_m_s   : LREAL := 0.0;    // 机构 BD 长度速度，m/s
+
+    // AC/BD 平面稳定离散导纳变量
+    AdmM_X_Use : LREAL := 0.40;
+    AdmM_Z_Use : LREAL := 0.40;
+    AdmB_X_UseSafe : LREAL := 0.75;
+    AdmB_Z_UseSafe : LREAL := 0.75;
+    Vxss_mps : LREAL := 0.0;
+    Vzss_mps : LREAL := 0.0;
+    Vx_ExpK : LREAL := 1.0;
+    Vz_ExpK : LREAL := 1.0;
+    Vplane_NumLimit_mps : LREAL := 1000.0;
+
+    // AF 俯仰 Tz/Mz 角导纳
+    AdmJ_AF : LREAL := 0.16;          // 增大虚拟惯量，减小起步角加速度
+    AdmB_Move_AF : LREAL := 1.6;      // 提高运动阻尼，降低同样力矩下的稳定角速度
+    AdmB_Stop_AF : LREAL := 4.0;      // 撤力时平滑衰减，最终减速度仍受轴限幅约束
+    AdmB_Use_AF : LREAL := 1.6;
+    Madm_AF : LREAL := 0.0;
+    AF_W_enc_s : LREAL := 0.0;
+    AF_W_last_enc_s : LREAL := 0.0;
+    AF_Alpha_enc_s2 : LREAL := 0.0;
+    Dir_Mz_AF : LREAL := -1.0;       // AF 俯仰方向已反向修正；若仍反，再改回 1
+
+    // AF 稳定停车/数值保护变量
+    bAF_TorqueActive : BOOL := FALSE;
+    AdmJ_AF_Use : LREAL := 0.16;
+    AdmB_AF_UseSafe : LREAL := 1.6;
+    AF_ExpK : LREAL := 1.0;          // 精确离散指数项 EXP(-B*Ts/J)
+    AF_Wss_enc_s : LREAL := 0.0;     // 当前导纳稳态速度 Madm/B
+    AF_StopZeroVel_enc_s : LREAL := 0.02;
+    AF_NumLimit_enc_s : LREAL := 100000.0;       // AF 俯仰方向已反向修正；若仍反，再改回 1
+
+    // 底座 yaw：Tx/Ty 随 AF 姿态组合后的旋转导纳
+    AdmJ_Yaw : LREAL := 0.16;
+    AdmB_Move_Yaw : LREAL := 0.80;      // 提高运动阻尼，降低同样输入下的稳定角速度
+    AdmB_Stop_Yaw : LREAL := 2.0;       // 撤力时平滑衰减，最终减速度仍受轴限幅约束
+    AdmB_Use_Yaw : LREAL := 0.80;
+    Madm_Yaw : LREAL := 0.0;
+    Yaw_W_enc_s : LREAL := 0.0;
+    Yaw_W_last_enc_s : LREAL := 0.0;
+    Yaw_Alpha_enc_s2 : LREAL := 0.0;
+    Dir_Mx_Yaw : LREAL := -1.0;      // 你已确认 -1 时底座 yaw 方向正确
+
+    // yaw 稳定离散导纳 + 独立减速度限幅
+    // 用于支持较大的 AdmB_Stop_Yaw，避免显式欧拉在撤力时发散。
+    YawInput_Nm : LREAL := 0.0;
+    Yaw_Dmax_enc_s2 : LREAL := 45.0;      // 正常减速/反向限幅；急停由独立 MC_Stop 处理
+    Yaw_ExpK : LREAL := 1.0;
+    Yaw_Wss_enc_s : LREAL := 0.0;
+    AdmJ_Yaw_Use : LREAL := 0.16;
+    AdmB_Yaw_UseSafe : LREAL := 0.80;
+    Yaw_NumLimit_enc_s : LREAL := 100000.0;
+    Yaw_dV_enc_s : LREAL := 0.0;
+    Yaw_dVmax_enc_s : LREAL := 0.0;
+
+
+    // =========================================================
+    // 12. 轴速度、加速度限制
+    // 输出到 NC 编码器坐标
+    // BD：编码器 mm/s
+    // AC：编码器 deg/s 或当前 NC 单位/s
+    // =========================================================
+    BD_Vraw_enc_s : LREAL := 0.0;
+    AC_Vraw_enc_s : LREAL := 0.0;
+    AF_Vraw_enc_s : LREAL := 0.0;
+    Yaw_Vraw_enc_s : LREAL := 0.0;
+
+    BD_Vcmd_enc_s : LREAL := 0.0;
+    AC_Vcmd_enc_s : LREAL := 0.0;
+    AF_Vcmd_enc_s : LREAL := 0.0;
+    Yaw_Vcmd_enc_s : LREAL := 0.0;
+
+    BD_Vlast_enc_s : LREAL := 0.0;
+    AC_Vlast_enc_s : LREAL := 0.0;
+    AF_Vlast_enc_s : LREAL := 0.0;
+    Yaw_Vlast_enc_s : LREAL := 0.0;
+
+    BD_Acmd_enc_s2 : LREAL := 0.0;
+    AC_Acmd_enc_s2 : LREAL := 0.0;
+    AF_Acmd_enc_s2 : LREAL := 0.0;
+    Yaw_Acmd_enc_s2 : LREAL := 0.0;
+
+    BD_Vmax_enc_s : LREAL := 100.0;
+    AC_Vmax_enc_s : LREAL := 50;
+    AF_Vmax_enc_s : LREAL := 15.0;
+    Yaw_Vmax_enc_s : LREAL := 7.0;
+
+    BD_Amax_enc_s2 : LREAL := 15.0;
+    AC_Amax_enc_s2 : LREAL := 8.0;
+    BD_Dmax_enc_s2 : LREAL := 80.0;     // 正常撤力/反向减速度限幅
+    AC_Dmax_enc_s2 : LREAL := 60.0;     // 正常撤力/反向减速度限幅
+    AF_Amax_enc_s2 : LREAL := 15.0;     // AF 加速限幅
+    AF_Dmax_enc_s2 : LREAL := 60.0;     // AF 正常减速/反向限幅
+    Yaw_Amax_enc_s2 : LREAL := 12.0;
+
+    BD_dV_enc_s : LREAL := 0.0;
+    AC_dV_enc_s : LREAL := 0.0;
+    BD_dVmax_enc_s : LREAL := 0.0;
+    AC_dVmax_enc_s : LREAL := 0.0;
+
+    AF_dV_enc_s : LREAL := 0.0;
+    AF_dVmax_enc_s : LREAL := 0.0;
+
+    DirBD : DINT := 0;
+    DirAC : DINT := 0;
+    DirAF : DINT := 0;
+    DirYaw : DINT := 0;
+
+
+    // =========================================================
+    // 13. 基础限位
+    // 手动：axis1 2~600，axis4 -30~90
+    // 力控：只对 axis1=BD 使用 2~600
+    // =========================================================
+    BD_EncMin : LREAL := 2.0;
+    BD_EncMax : LREAL := 600.0;
+
+    Base_EncMin : LREAL := -30.0;
+    Base_EncMax : LREAL := 90.0;
+
+    bUseAFLimit : BOOL := TRUE;
+    AF_EncMin : LREAL := 48.0;//极限限位
+    AF_EncMax : LREAL := 208.0;      // AF=205° 为水平，限位需大于水平编码器
+
+    bForceSoftLimit : BOOL := FALSE;
+    BD_NextCmd_Enc  : LREAL := 0.0;
+    AC_NextCmd_Enc  : LREAL := 0.0;
+    AF_NextCmd_Enc  : LREAL := 0.0;
+    Yaw_NextCmd_Enc : LREAL := 0.0;
+
+
+    // =========================================================
+    // 14. 错误输出
+    // =========================================================
+    bError   : BOOL := FALSE;
+    nErrorID : UDINT := 0;
+
+    // =========================================================
+    // 15. 机构学限位保护：真实 ∠CAF + CE-HI 中心线距离
+    // 以下为新增变量，已并入完整 VAR 区
+    // =========================================================
+    // 机构学限位保护总开关
+    bUseCAFLimit  : BOOL := TRUE;
+    bUseCEHILimit : BOOL := TRUE;
+
+    // 后级几何参数
+    l_CH_m : LREAL := 0.26;
+    GCH_Angle_deg : LREAL := 90.0;
+
+  
+    AF_EndOffset_deg : LREAL := 14.5;
+
+    // 第一种限位：真实 ∠CAF
+    CAF_Max_AC_Enc_deg : LREAL := -48.0;
+    CAF_Max_AF_Enc_deg : LREAL := 78.0;
+
+    CAF_Min_AC_Enc_deg : LREAL := -50.0;
+    CAF_Min_AF_Enc_deg : LREAL := 203.0;
+
+    CAF_AngleNow_deg      : LREAL := 0.0;
+    CAF_AngleMinLimit_deg : LREAL := 0.0;
+    CAF_AngleMaxLimit_deg : LREAL := 0.0;
+    CAF_Tmp_deg           : LREAL := 0.0;
+
+    CAF_SafetyMargin_deg  : LREAL := 2.0;
+    CAF_TestStep_AC_deg   : LREAL := 0.2;
+    CAF_TestStep_AF_deg   : LREAL := 0.2;
+    CAF_Eps_deg           : LREAL := 0.01;
+
+    CAF_Angle_AC_Pos_deg : LREAL := 0.0;
+    CAF_Angle_AC_Neg_deg : LREAL := 0.0;
+    CAF_Angle_AF_Pos_deg : LREAL := 0.0;
+    CAF_Angle_AF_Neg_deg : LREAL := 0.0;
+
+    bCAF_AtMin : BOOL := FALSE;
+    bCAF_AtMax : BOOL := FALSE;
+
+    bCAF_Block_AC_Pos : BOOL := FALSE;
+    bCAF_Block_AC_Neg : BOOL := FALSE;
+    bCAF_Block_AF_Pos : BOOL := FALSE;
+    bCAF_Block_AF_Neg : BOOL := FALSE;
+
+    // 第二种限位：真实 CE-HI 中心线距离
+    // 关键修改：
+    // 1) CEHI_DisMinLimit_m 改为手动边界 0.080 m，不再由旧函数标定点反算。
+    // 2) CEHI_DisNow_m 由 FB_Calc_CEHI_Geo 计算出的 H/I 点反算平均距离得到。
+    // 3) CEHI 候选方向用同一套几何函数 F_Calc_CEHI_Dis_m，避免两套距离逻辑不一致。
+    CEHI_Lim_BD_Enc_mm  : LREAL := 134.39;    // 保留监控，不作为当前边界来源
+    CEHI_Lim_AC_Enc_deg : LREAL := -50.0;     // 保留监控
+    CEHI_Lim_AF_Enc_deg : LREAL := 80.0;      // 保留监控
+
+    CEHI_DisNow_m         : LREAL := 0.0;
+    CEHI_DisNow_mm        : LREAL := 0.0;
+    CEHI_DisMinLimit_m    : LREAL := 0.069;   // 手动最小 CE-HI 中心线距离，单位 m；80 mm
+    CEHI_DisMinLimit_mm   : LREAL := 069.0;
+    CEHI_DisMinSafe_m     : LREAL := 0.069;
+    CEHI_DisMinSafe_mm    : LREAL := 69.0;
+
+    CEHI_SafetyMargin_m   : LREAL := 0.000;   // 当前先不额外加 5 mm，避免提前误锁；验证稳定后可改 0.003~0.005
+    CEHI_TestStep_BD_mm   : LREAL := 1.0;
+    CEHI_TestStep_AC_deg  : LREAL := 0.2;
+    CEHI_TestStep_AF_deg  : LREAL := 0.2;
+    CEHI_Eps_m            : LREAL := 0.000001;  // 方向预测微小容差，1 um
+
+    CEHI_Dis_BD_Pos_m : LREAL := 0.0;
+    CEHI_Dis_BD_Neg_m : LREAL := 0.0;
+    CEHI_Dis_AC_Pos_m : LREAL := 0.0;
+    CEHI_Dis_AC_Neg_m : LREAL := 0.0;
+    CEHI_Dis_AF_Pos_m : LREAL := 0.0;
+    CEHI_Dis_AF_Neg_m : LREAL := 0.0;
+
+    CEHI_Allow_BD_Pos : BOOL := TRUE;
+    CEHI_Allow_BD_Neg : BOOL := TRUE;
+    CEHI_Allow_AC_Pos : BOOL := TRUE;
+    CEHI_Allow_AC_Neg : BOOL := TRUE;
+    CEHI_Allow_AF_Pos : BOOL := TRUE;
+    CEHI_Allow_AF_Neg : BOOL := TRUE;
+
+    bCEHI_GeoOK        : BOOL := FALSE;
+    bCEHI_LimitGeoOK   : BOOL := TRUE;    // 由于边界手动给定，默认有效
+    bCEHI_NowGeoOK     : BOOL := FALSE;
+    bCEHI_AtLimit      : BOOL := FALSE;
+
+    bCEHI_Alarm_LimitGeoInvalid : BOOL := FALSE;
+    bCEHI_InvalidRecoveryMode   : BOOL := FALSE;
+    bCEHI_RecoveryAnyDir        : BOOL := FALSE;
+    bCEHI_AllowRecoveryOnInvalid : BOOL := TRUE;
+
+    bCEHI_Block_BD_Pos : BOOL := FALSE;
+    bCEHI_Block_BD_Neg : BOOL := FALSE;
+    bCEHI_Block_AC_Pos : BOOL := FALSE;
+    bCEHI_Block_AC_Neg : BOOL := FALSE;
+    bCEHI_Block_AF_Pos : BOOL := FALSE;
+    bCEHI_Block_AF_Neg : BOOL := FALSE;
+
+    // 旧变量保留，但主函数不再使用“几何无效直接全锁死”。
+    bCEHI_BlockOnInvalid : BOOL := FALSE;
+
+    // CE-HI 几何计算与调试输出
+    fbCEHI_Now : FB_Calc_CEHI_Geo;
+
+    CEHI_GeomValid : BOOL := FALSE;
+    CEHI_ErrorID : INT := 0;
+
+    Qx : LREAL := 0.0;                 // q：D 到 CE 的垂足，避免和后级 H 点混名
+    Qz : LREAL := 0.0;
+
+    CEHI_Hx_m : LREAL := 0.0;
+    CEHI_Hz_m : LREAL := 0.0;
+    CEHI_Ix_m : LREAL := 0.0;
+    CEHI_Iz_m : LREAL := 0.0;
+
+    CEHI_ThetaCH_rad : LREAL := 0.0;
+    CEHI_ThetaCH_deg : LREAL := 0.0;
+    CEHI_DeltaCH_CE_deg : LREAL := 0.0;
+
+    CEHI_uCEx : LREAL := 1.0;
+    CEHI_uCEz : LREAL := 0.0;
+
+    CEHI_DisSigned_m : LREAL := 0.0;
+    CEHI_DisFromH_m : LREAL := 0.0;
+    CEHI_DisFromI_m : LREAL := 0.0;
+    CEHI_DisFromHIAvg_m : LREAL := 0.0;
+    CEHI_DisDiff_m : LREAL := 0.0;
+
+    CEHI_CE_L_Check_m : LREAL := 0.0;
+    CEHI_Q_Offset_Check_m : LREAL := 0.0;
+    CEHI_CH_L_Check_m : LREAL := 0.0;
+    CEHI_EI_L_Check_m : LREAL := 0.0;
+    CEHI_HI_L_Check_m : LREAL := 0.0;
+    CEHI_HI_ParallelErr_m : LREAL := 0.0;
+
+    // CE-HI 后级杆 CH 的角度映射
+    // thetaCH_deg = AF_EncDir_CH * (AF_Enc - AF_HorizontalEnc_deg) + AF_CHOffset_deg
+    // 当前按你最新测试使用：AF=205 时末端水平，CH 相对工具偏置约 15°。
+    AF_EncDir_CH : LREAL := -1.0;
+    AF_CHOffset_deg : LREAL := 11.4;
+
+    // BD 三角装配分支，沿用原 PLC / MATLAB 验证：thetaBD = alphaBC - beta。
+    BD_BRANCH : LREAL := -1.0;
+
+    bLimitClampPlanar : BOOL := FALSE;
+    bLimitClampAF     : BOOL := FALSE;
+	
+	StopReasonCode : INT := 0;
+// 0=无
+// 1=力控掉线
+// 2=轴未Ready
+// 3=轴错误
+// 4=CEHI限位
+// 5=CAF限位
+// 6=外部给定关闭
+// 7=抱闸/轴1运动许可丢失
+
+axis1_status : MC_ReadStatus;
+axis2_status : MC_ReadStatus;
+axis3_status : MC_ReadStatus;
+axis4_status : MC_ReadStatus;
+
+bAxis1Err : BOOL := FALSE;
+bAxis2Err : BOOL := FALSE;
+bAxis3Err : BOOL := FALSE;
+bAxis4Err : BOOL := FALSE;
+bAnyAxisErr : BOOL := FALSE;
+
+bStopReasonLatched : BOOL := FALSE;
+bResetStopReason : BOOL := FALSE;
+
+acttorqueAC  :LREAL;
+acttorqueBD  :LREAL;
+acttorqueAF  :LREAL;
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[
+
+// =============================================================
+// A. 轴声明
+// =============================================================
+axis1();
+axis2();
+axis3();
+axis4();
+
+
+// =============================================================
+// B. 急停状态、力控模式请求与边沿
+// =============================================================
+// jitingjudge：TRUE 正常，FALSE 急停/停止。
+// 逻辑目标：
+// 1) 按下急停：立即退出力控，力控灯灭，所有速度/外部给定撤销；
+// 2) 松开急停：自动请求 MC_Reset，但不自动重新进入力控；
+// 3) 必须先松开 bInput_ForceMode，再重新按下，才允许再次进入力控。
+
+ bEStopActive := NOT jitingjudge;
+ bSafetyOK := NOT bEStopActive;
+
+ bEStopRise := bEStopActive AND NOT bEStopLast;
+ bEStopFall := (NOT bEStopActive) AND bEStopLast;
+ bEStopLast := bEStopActive;
+
+ // 急停按下后置位重入互锁；力控按钮松开后才允许再次进入力控。
+ IF bEStopRise OR bEStopActive THEN
+    bForceRearmRequired := TRUE;
+ END_IF;
+
+ IF NOT bInput_ForceMode THEN
+    bForceRearmRequired := FALSE;
+ END_IF;
+ // 急停松开后请求清轴错误。
+ IF bEStopFall THEN
+    bNeedAxisReset := TRUE;
+    bAfterEStopInitDone := FALSE;
+ END_IF;
+ // 真实力控请求。
+ // 注意：bAxesReadyForForce 在 power/reset 段更新；这里使用上一周期值，下一周期即可生效。
+ bForceRequest :=
+    bInput_ForceMode
+    AND bSafetyOK
+    AND NOT bForceRearmRequired
+    AND bAxesReadyForForce;
+ bForceMode := bForceRequest;
+ bManualMode := NOT bForceMode;
+
+ bForceRise := bForceMode AND NOT bForceModeOld;
+ bForceFall := (NOT bForceMode) AND bForceModeOld;
+ bForceModeOld := bForceMode;
+
+ bZeroRise := bInput_ZeroForce AND NOT bZeroOld;
+ bZeroOld := bInput_ZeroForce;
+
+ // 急停期间最高优先级退出力控，避免后续导纳继续用上一周期 bRunForce。
+ IF bEStopActive THEN
+    bForceMode := FALSE;
+    bManualMode := TRUE;
+    bRunForce := FALSE;
+ END_IF;
+
+
+// =============================================================
+// C. 读取实际编码器
+// =============================================================
+BD_ActEnc := axis1.NcToPlc.ActPos;
+AC_ActEnc := axis2.NcToPlc.ActPos;
+AF_ActEnc := axis3.NcToPlc.ActPos;
+Yaw_ActEnc := axis4.NcToPlc.ActPos;
+acttorqueAC := axis2.NcToPlc.ActTorque;   // AC大臂
+acttorqueBD := axis1.NcToPlc.ActTorque;   // BD电缸
+acttorqueAF := axis3.NcToPlc.ActTorque;   // AF俯仰
+
+
+
+// AF 实际速度监控
+// 注意：VAR 区的 := 只是初始化，不能用来周期性读取 ActVelo。
+AF_ActVel_NC_enc_s := axis3.NcToPlc.ActVelo;
+
+IF NOT bAF_ActVelInit THEN
+    AF_ActEnc_Last := AF_ActEnc;
+    AF_ActVel_calc_enc_s := 0.0;
+    AF_ActVel_enc_s := 0.0;
+    bAF_ActVelInit := TRUE;
+ELSE
+    IF Ts > 0.000001 THEN
+        AF_ActVel_calc_enc_s := (AF_ActEnc - AF_ActEnc_Last) / Ts;
+    ELSE
+        AF_ActVel_calc_enc_s := 0.0;
+    END_IF;
+
+    AF_ActVel_enc_s := AF_ActVel_calc_enc_s;
+    AF_ActEnc_Last := AF_ActEnc;
+END_IF;
+
+IF ABS(AF_Vcmd_enc_s) > 0.001 THEN
+    AF_VelRatio_Calc := AF_ActVel_enc_s / AF_Vcmd_enc_s;
+ELSE
+    AF_VelRatio_Calc := 0.0;
+END_IF;
+
+AF_PosLag_Enc := AF_PosCmd_Enc - AF_ActEnc;
+
+
+// =============================================================
+// C0. 急停按下时立即撤销力控运动状态
+// 必须放在导纳、限位、外部给定之前。
+// =============================================================
+IF bEStopActive THEN
+    // 导纳和速度全部清零
+    Vx_mps := 0.0;
+    Vz_mps := 0.0;
+    Vx_last_mps := 0.0;
+    Vz_last_mps := 0.0;
+    Ax_mps2 := 0.0;
+    Az_mps2 := 0.0;
+
+    BD_Vraw_enc_s := 0.0;
+    AC_Vraw_enc_s := 0.0;
+    BD_Vcmd_enc_s := 0.0;
+    AC_Vcmd_enc_s := 0.0;
+    BD_Vlast_enc_s := 0.0;
+    AC_Vlast_enc_s := 0.0;
+    BD_Acmd_enc_s2 := 0.0;
+    AC_Acmd_enc_s2 := 0.0;
+
+    AF_W_enc_s := 0.0;
+    AF_W_last_enc_s := 0.0;
+    AF_Alpha_enc_s2 := 0.0;
+    AF_Vraw_enc_s := 0.0;
+    AF_Vcmd_enc_s := 0.0;
+    AF_Vlast_enc_s := 0.0;
+    AF_Acmd_enc_s2 := 0.0;
+
+    Yaw_W_enc_s := 0.0;
+    Yaw_W_last_enc_s := 0.0;
+    Yaw_Alpha_enc_s2 := 0.0;
+    Yaw_Vraw_enc_s := 0.0;
+    Yaw_Vcmd_enc_s := 0.0;
+    Yaw_Vlast_enc_s := 0.0;
+    Yaw_Acmd_enc_s2 := 0.0;
+
+    // 外部给定撤销，避免急停恢复后继续追旧目标。
+    bFeedBD := FALSE;
+    bFeedAC := FALSE;
+    bFeedAF := FALSE;
+    bFeedYaw := FALSE;
+
+    bExtBD := FALSE;
+    bExtAC := FALSE;
+    bExtAF := FALSE;
+    bExtYaw := FALSE;
+
+    // 目标位置对齐实际位置，防止恢复后跳变。
+    BD_PosCmd_Enc := BD_ActEnc;
+    AC_PosCmd_Enc := AC_ActEnc;
+    AF_PosCmd_Enc := AF_ActEnc;
+    Yaw_PosCmd_Enc := Yaw_ActEnc;
+
+    // 力控灯按真实力控状态显示，急停时强制灭。
+    likonglight := FALSE;
+END_IF;
+
+
+// =============================================================
+// C1. 机构学限位预判断：真实 ∠CAF + CE-HI 中心线距离
+// 必须放在点动和力控计算之前
+// =============================================================
+
+// -------------------------------------------------------------
+// 第一种限位：真实 ∠CAF 夹角限位
+// 标定点：
+//   最大夹角点：AC=-48, AF=80
+//   最小夹角点：AC=-50, AF=205
+// 作用轴：AC、AF
+// -------------------------------------------------------------
+CAF_AngleMaxLimit_deg := F_Calc_CAF_Angle_deg(
+    AC_Enc_deg := CAF_Max_AC_Enc_deg,
+    AF_Enc_deg := CAF_Max_AF_Enc_deg,
+    AC_EncRef_deg := AC_EncRef_deg,
+    AC_ThetaRef_deg := AC_ThetaRef_deg,
+    AF_HorizontalEnc_deg := AF_HorizontalEnc_deg,
+    GCH_Angle_deg := GCH_Angle_deg,
+    AF_EndOffset_deg := AF_EndOffset_deg
+);
+
+CAF_AngleMinLimit_deg := F_Calc_CAF_Angle_deg(
+    AC_Enc_deg := CAF_Min_AC_Enc_deg,
+    AF_Enc_deg := CAF_Min_AF_Enc_deg,
+    AC_EncRef_deg := AC_EncRef_deg,
+    AC_ThetaRef_deg := AC_ThetaRef_deg,
+    AF_HorizontalEnc_deg := AF_HorizontalEnc_deg,
+    GCH_Angle_deg := GCH_Angle_deg,
+    AF_EndOffset_deg := AF_EndOffset_deg
+);
+
+// 自动排序，避免变量名和实际角度大小冲突
+IF CAF_AngleMinLimit_deg > CAF_AngleMaxLimit_deg THEN
+    CAF_Tmp_deg := CAF_AngleMinLimit_deg;
+    CAF_AngleMinLimit_deg := CAF_AngleMaxLimit_deg;
+    CAF_AngleMaxLimit_deg := CAF_Tmp_deg;
+END_IF;
+
+CAF_AngleNow_deg := F_Calc_CAF_Angle_deg(
+    AC_Enc_deg := AC_ActEnc,
+    AF_Enc_deg := AF_ActEnc,
+    AC_EncRef_deg := AC_EncRef_deg,
+    AC_ThetaRef_deg := AC_ThetaRef_deg,
+    AF_HorizontalEnc_deg := AF_HorizontalEnc_deg,
+    GCH_Angle_deg := GCH_Angle_deg,
+    AF_EndOffset_deg := AF_EndOffset_deg
+);
+
+bCAF_AtMin := FALSE;
+bCAF_AtMax := FALSE;
+
+bCAF_Block_AC_Pos := FALSE;
+bCAF_Block_AC_Neg := FALSE;
+bCAF_Block_AF_Pos := FALSE;
+bCAF_Block_AF_Neg := FALSE;
+
+IF bUseCAFLimit THEN
+
+    bCAF_AtMin := CAF_AngleNow_deg <= (CAF_AngleMinLimit_deg + CAF_SafetyMargin_deg);
+    bCAF_AtMax := CAF_AngleNow_deg >= (CAF_AngleMaxLimit_deg - CAF_SafetyMargin_deg);
+
+    CAF_Angle_AC_Pos_deg := F_Calc_CAF_Angle_deg(
+        AC_Enc_deg := AC_ActEnc + CAF_TestStep_AC_deg,
+        AF_Enc_deg := AF_ActEnc,
+        AC_EncRef_deg := AC_EncRef_deg,
+        AC_ThetaRef_deg := AC_ThetaRef_deg,
+        AF_HorizontalEnc_deg := AF_HorizontalEnc_deg,
+        GCH_Angle_deg := GCH_Angle_deg,
+        AF_EndOffset_deg := AF_EndOffset_deg
+    );
+
+    CAF_Angle_AC_Neg_deg := F_Calc_CAF_Angle_deg(
+        AC_Enc_deg := AC_ActEnc - CAF_TestStep_AC_deg,
+        AF_Enc_deg := AF_ActEnc,
+        AC_EncRef_deg := AC_EncRef_deg,
+        AC_ThetaRef_deg := AC_ThetaRef_deg,
+        AF_HorizontalEnc_deg := AF_HorizontalEnc_deg,
+        GCH_Angle_deg := GCH_Angle_deg,
+        AF_EndOffset_deg := AF_EndOffset_deg
+    );
+
+    CAF_Angle_AF_Pos_deg := F_Calc_CAF_Angle_deg(
+        AC_Enc_deg := AC_ActEnc,
+        AF_Enc_deg := AF_ActEnc + CAF_TestStep_AF_deg,
+        AC_EncRef_deg := AC_EncRef_deg,
+        AC_ThetaRef_deg := AC_ThetaRef_deg,
+        AF_HorizontalEnc_deg := AF_HorizontalEnc_deg,
+        GCH_Angle_deg := GCH_Angle_deg,
+        AF_EndOffset_deg := AF_EndOffset_deg
+    );
+
+    CAF_Angle_AF_Neg_deg := F_Calc_CAF_Angle_deg(
+        AC_Enc_deg := AC_ActEnc,
+        AF_Enc_deg := AF_ActEnc - CAF_TestStep_AF_deg,
+        AC_EncRef_deg := AC_EncRef_deg,
+        AC_ThetaRef_deg := AC_ThetaRef_deg,
+        AF_HorizontalEnc_deg := AF_HorizontalEnc_deg,
+        GCH_Angle_deg := GCH_Angle_deg,
+        AF_EndOffset_deg := AF_EndOffset_deg
+    );
+
+    // 若候选方向会继续逼近最小夹角或最大夹角，则禁止该方向
+    bCAF_Block_AC_Pos :=
+        (
+            (CAF_Angle_AC_Pos_deg < (CAF_AngleNow_deg - CAF_Eps_deg))
+            AND (CAF_Angle_AC_Pos_deg <= (CAF_AngleMinLimit_deg + CAF_SafetyMargin_deg))
+        )
+        OR
+        (
+            (CAF_Angle_AC_Pos_deg > (CAF_AngleNow_deg + CAF_Eps_deg))
+            AND (CAF_Angle_AC_Pos_deg >= (CAF_AngleMaxLimit_deg - CAF_SafetyMargin_deg))
+        );
+
+    bCAF_Block_AC_Neg :=
+        (
+            (CAF_Angle_AC_Neg_deg < (CAF_AngleNow_deg - CAF_Eps_deg))
+            AND (CAF_Angle_AC_Neg_deg <= (CAF_AngleMinLimit_deg + CAF_SafetyMargin_deg))
+        )
+        OR
+        (
+            (CAF_Angle_AC_Neg_deg > (CAF_AngleNow_deg + CAF_Eps_deg))
+            AND (CAF_Angle_AC_Neg_deg >= (CAF_AngleMaxLimit_deg - CAF_SafetyMargin_deg))
+        );
+
+    bCAF_Block_AF_Pos :=
+        (
+            (CAF_Angle_AF_Pos_deg < (CAF_AngleNow_deg - CAF_Eps_deg))
+            AND (CAF_Angle_AF_Pos_deg <= (CAF_AngleMinLimit_deg + CAF_SafetyMargin_deg))
+        )
+        OR
+        (
+            (CAF_Angle_AF_Pos_deg > (CAF_AngleNow_deg + CAF_Eps_deg))
+            AND (CAF_Angle_AF_Pos_deg >= (CAF_AngleMaxLimit_deg - CAF_SafetyMargin_deg))
+        );
+
+    bCAF_Block_AF_Neg :=
+        (
+            (CAF_Angle_AF_Neg_deg < (CAF_AngleNow_deg - CAF_Eps_deg))
+            AND (CAF_Angle_AF_Neg_deg <= (CAF_AngleMinLimit_deg + CAF_SafetyMargin_deg))
+        )
+        OR
+        (
+            (CAF_Angle_AF_Neg_deg > (CAF_AngleNow_deg + CAF_Eps_deg))
+            AND (CAF_Angle_AF_Neg_deg >= (CAF_AngleMaxLimit_deg - CAF_SafetyMargin_deg))
+        );
+
+END_IF;
+
+// -------------------------------------------------------------
+// 第二种限位：真实 CE-HI 中心线距离限位
+// 作用轴：BD、AC、AF
+//
+// 1) CEHI_DisMinLimit_m 固定为 0.080 m，
+// 2) CEHI_DisNow_m 只来自当前 H/I 点反算的平均中心线距：CEHI_DisFromHIAvg_m。
+// 3) 六个候选方向 BD+/BD-/AC+/AC-/AF+/AF- 仍用同一套几何模型预测。
+// 4) 若当前位置已小于 0.080 m，不全锁死；只允许让距离变大的方向。
+// 5) CEHI 限位只影响 BD/AC/AF，不影响底盘 yaw、电磁阀、灯输出。
+// -------------------------------------------------------------
+
+// 手动设置 CE-HI 最小允许距离：
+CEHI_DisMinLimit_m := 0.169;
+CEHI_DisMinLimit_mm := CEHI_DisMinLimit_m * 1000.0;
+CEHI_DisMinSafe_m := CEHI_DisMinLimit_m + CEHI_SafetyMargin_m;
+CEHI_DisMinSafe_mm := CEHI_DisMinSafe_m * 1000.0;
+
+// 当前 CE-HI 几何：同时输出 C/D/q/E/H/I 和 H/I 反算距离
+fbCEHI_Now(
+    BD_Enc_mm := BD_ActEnc,
+    AC_Enc_deg := AC_ActEnc,
+    AF_Enc_deg := AF_ActEnc,
+
+    BD_KinOffset_mm := BD_KinOffset_mm,
+    AC_EncRef_deg := AC_EncRef_deg,
+    AC_ThetaRef_deg := AC_ThetaRef_deg,
+
+    Ax0 := Ax0,
+    Az0 := Az0,
+    Bx0 := Bx0,
+    Bz0 := Bz0,
+
+    l_AC_m := l_AC,
+    l_CD_m := l_CD,
+    l_CE_m := l_CE,
+    qOffset_m := D_Offset_m,
+    l_CH_m := l_CH_m,
+
+    BD_BRANCH := BD_BRANCH,//D 点在 BC 哪一侧
+    CE_SIGN := CE_Sign,//D 点在 CE 哪一侧
+
+    AF_HorizontalEnc_deg := AF_HorizontalEnc_deg,
+    AF_CHOffset_deg := AF_CHOffset_deg,//AF 编码器处于“水平参考值”时，CH 杆相对于全局 X 轴实际应该是多少度。
+    AF_EncDir_CH := AF_EncDir_CH,//AF编码器与实际角度变化关系
+
+    GeoMargin_m := GeoMargin_m
+);
+
+CEHI_GeomValid := fbCEHI_Now.Valid;
+CEHI_ErrorID := fbCEHI_Now.ErrorID;
+
+IF CEHI_GeomValid THEN
+    Cx := fbCEHI_Now.Cx;
+    Cz := fbCEHI_Now.Cz;
+    Dx := fbCEHI_Now.Dx;
+    Dz := fbCEHI_Now.Dz;
+    Qx := fbCEHI_Now.Qx;
+    Qz := fbCEHI_Now.Qz;
+    Ex := fbCEHI_Now.Ex;
+    Ez := fbCEHI_Now.Ez;
+    thetaCE_th := fbCEHI_Now.thetaCE_rad;
+
+    CEHI_Hx_m := fbCEHI_Now.Hx;
+    CEHI_Hz_m := fbCEHI_Now.Hz;
+    CEHI_Ix_m := fbCEHI_Now.Ix;
+    CEHI_Iz_m := fbCEHI_Now.Iz;
+
+    CEHI_ThetaCH_rad := fbCEHI_Now.ThetaCH_rad;
+    CEHI_ThetaCH_deg := fbCEHI_Now.ThetaCH_deg;
+    CEHI_DeltaCH_CE_deg := fbCEHI_Now.DeltaCH_CE_deg;
+
+    CEHI_uCEx := fbCEHI_Now.uCEx;
+    CEHI_uCEz := fbCEHI_Now.uCEz;
+
+    CEHI_DisSigned_m := fbCEHI_Now.CEHI_DisSigned_m;
+    CEHI_DisFromH_m := fbCEHI_Now.DisFromH_m;
+    CEHI_DisFromI_m := fbCEHI_Now.DisFromI_m;
+    CEHI_DisFromHIAvg_m := fbCEHI_Now.DisFromHIAvg_m;
+
+    // 关键：实时限位距离只使用 H/I 点反算平均值，不再混用旧函数返回值。
+    CEHI_DisNow_m := CEHI_DisFromHIAvg_m;
+    CEHI_DisNow_mm := CEHI_DisNow_m * 1000.0;
+    CEHI_DisDiff_m := CEHI_DisNow_m - CEHI_DisFromHIAvg_m;
+
+    CEHI_CE_L_Check_m := fbCEHI_Now.CE_L_Check_m;
+    CEHI_Q_Offset_Check_m := fbCEHI_Now.Q_Offset_Check_m;
+    CEHI_CH_L_Check_m := fbCEHI_Now.CH_L_Check_m;
+    CEHI_EI_L_Check_m := fbCEHI_Now.EI_L_Check_m;
+    CEHI_HI_L_Check_m := fbCEHI_Now.HI_L_Check_m;
+    CEHI_HI_ParallelErr_m := fbCEHI_Now.HI_ParallelErr_m;
+ELSE
+    CEHI_DisNow_m := -1.0;
+    CEHI_DisNow_mm := -1.0;
+    CEHI_DisSigned_m := 0.0;
+    CEHI_DisFromH_m := -1.0;
+    CEHI_DisFromI_m := -1.0;
+    CEHI_DisFromHIAvg_m := -1.0;
+    CEHI_DisDiff_m := 0.0;
+END_IF;
+
+bCEHI_LimitGeoOK := CEHI_DisMinLimit_m > 0.0;
+bCEHI_NowGeoOK := CEHI_GeomValid AND (CEHI_DisNow_m > 0.0);
+bCEHI_GeoOK := bCEHI_LimitGeoOK AND bCEHI_NowGeoOK;
+bCEHI_AtLimit := FALSE;
+bCEHI_Alarm_LimitGeoInvalid := FALSE;
+bCEHI_InvalidRecoveryMode := FALSE;
+bCEHI_RecoveryAnyDir := FALSE;
+
+CEHI_Allow_BD_Pos := TRUE;
+CEHI_Allow_BD_Neg := TRUE;
+CEHI_Allow_AC_Pos := TRUE;
+CEHI_Allow_AC_Neg := TRUE;
+CEHI_Allow_AF_Pos := TRUE;
+CEHI_Allow_AF_Neg := TRUE;
+
+bCEHI_Block_BD_Pos := FALSE;
+bCEHI_Block_BD_Neg := FALSE;
+bCEHI_Block_AC_Pos := FALSE;
+bCEHI_Block_AC_Neg := FALSE;
+bCEHI_Block_AF_Pos := FALSE;
+bCEHI_Block_AF_Neg := FALSE;
+
+IF bUseCEHILimit THEN
+    IF NOT bCEHI_LimitGeoOK THEN
+        // 手动边界 <=0 才会进入这里。属于参数错误。
+        bCEHI_Alarm_LimitGeoInvalid := TRUE;
+
+        CEHI_Allow_BD_Pos := FALSE;
+        CEHI_Allow_BD_Neg := FALSE;
+        CEHI_Allow_AC_Pos := FALSE;
+        CEHI_Allow_AC_Neg := FALSE;
+        CEHI_Allow_AF_Pos := FALSE;
+        CEHI_Allow_AF_Neg := FALSE;
+    ELSE
+    CEHI_Dis_BD_Pos_m := F_Calc_CEHI_Dis_m(
+        BD_Enc_mm := BD_ActEnc + CEHI_TestStep_BD_mm,
+        AC_Enc_deg := AC_ActEnc,
+        AF_Enc_deg := AF_ActEnc,
+        BD_KinOffset_mm := BD_KinOffset_mm,
+        AC_EncRef_deg := AC_EncRef_deg,
+        AC_ThetaRef_deg := AC_ThetaRef_deg,
+        Ax0 := Ax0,
+        Az0 := Az0,
+        Bx0 := Bx0,
+        Bz0 := Bz0,
+        l_AC_m := l_AC,
+        l_CD_m := l_CD,
+        l_CE_m := l_CE,
+        qOffset_m := D_Offset_m,
+        l_CH_m := l_CH_m,
+        BD_BRANCH := BD_BRANCH,
+        CE_SIGN := CE_Sign,
+        AF_HorizontalEnc_deg := AF_HorizontalEnc_deg,
+        AF_CHOffset_deg := AF_CHOffset_deg,
+        AF_EncDir_CH := AF_EncDir_CH,
+        GeoMargin_m := GeoMargin_m
+    );
+    CEHI_Dis_BD_Neg_m := F_Calc_CEHI_Dis_m(
+        BD_Enc_mm := BD_ActEnc - CEHI_TestStep_BD_mm,
+        AC_Enc_deg := AC_ActEnc,
+        AF_Enc_deg := AF_ActEnc,
+        BD_KinOffset_mm := BD_KinOffset_mm,
+        AC_EncRef_deg := AC_EncRef_deg,
+        AC_ThetaRef_deg := AC_ThetaRef_deg,
+        Ax0 := Ax0,
+        Az0 := Az0,
+        Bx0 := Bx0,
+        Bz0 := Bz0,
+        l_AC_m := l_AC,
+        l_CD_m := l_CD,
+        l_CE_m := l_CE,
+        qOffset_m := D_Offset_m,
+        l_CH_m := l_CH_m,
+        BD_BRANCH := BD_BRANCH,
+        CE_SIGN := CE_Sign,
+        AF_HorizontalEnc_deg := AF_HorizontalEnc_deg,
+        AF_CHOffset_deg := AF_CHOffset_deg,
+        AF_EncDir_CH := AF_EncDir_CH,
+        GeoMargin_m := GeoMargin_m
+    );
+    CEHI_Dis_AC_Pos_m := F_Calc_CEHI_Dis_m(
+        BD_Enc_mm := BD_ActEnc,
+        AC_Enc_deg := AC_ActEnc + CEHI_TestStep_AC_deg,
+        AF_Enc_deg := AF_ActEnc,
+        BD_KinOffset_mm := BD_KinOffset_mm,
+        AC_EncRef_deg := AC_EncRef_deg,
+        AC_ThetaRef_deg := AC_ThetaRef_deg,
+        Ax0 := Ax0,
+        Az0 := Az0,
+        Bx0 := Bx0,
+        Bz0 := Bz0,
+        l_AC_m := l_AC,
+        l_CD_m := l_CD,
+        l_CE_m := l_CE,
+        qOffset_m := D_Offset_m,
+        l_CH_m := l_CH_m,
+        BD_BRANCH := BD_BRANCH,
+        CE_SIGN := CE_Sign,
+        AF_HorizontalEnc_deg := AF_HorizontalEnc_deg,
+        AF_CHOffset_deg := AF_CHOffset_deg,
+        AF_EncDir_CH := AF_EncDir_CH,
+        GeoMargin_m := GeoMargin_m
+    );
+    CEHI_Dis_AC_Neg_m := F_Calc_CEHI_Dis_m(
+        BD_Enc_mm := BD_ActEnc,
+        AC_Enc_deg := AC_ActEnc - CEHI_TestStep_AC_deg,
+        AF_Enc_deg := AF_ActEnc,
+        BD_KinOffset_mm := BD_KinOffset_mm,
+        AC_EncRef_deg := AC_EncRef_deg,
+        AC_ThetaRef_deg := AC_ThetaRef_deg,
+        Ax0 := Ax0,
+        Az0 := Az0,
+        Bx0 := Bx0,
+        Bz0 := Bz0,
+        l_AC_m := l_AC,
+        l_CD_m := l_CD,
+        l_CE_m := l_CE,
+        qOffset_m := D_Offset_m,
+        l_CH_m := l_CH_m,
+        BD_BRANCH := BD_BRANCH,
+        CE_SIGN := CE_Sign,
+        AF_HorizontalEnc_deg := AF_HorizontalEnc_deg,
+        AF_CHOffset_deg := AF_CHOffset_deg,
+        AF_EncDir_CH := AF_EncDir_CH,
+        GeoMargin_m := GeoMargin_m
+    );
+    CEHI_Dis_AF_Pos_m := F_Calc_CEHI_Dis_m(
+        BD_Enc_mm := BD_ActEnc,
+        AC_Enc_deg := AC_ActEnc,
+        AF_Enc_deg := AF_ActEnc + CEHI_TestStep_AF_deg,
+        BD_KinOffset_mm := BD_KinOffset_mm,
+        AC_EncRef_deg := AC_EncRef_deg,
+        AC_ThetaRef_deg := AC_ThetaRef_deg,
+        Ax0 := Ax0,
+        Az0 := Az0,
+        Bx0 := Bx0,
+        Bz0 := Bz0,
+        l_AC_m := l_AC,
+        l_CD_m := l_CD,
+        l_CE_m := l_CE,
+        qOffset_m := D_Offset_m,
+        l_CH_m := l_CH_m,
+        BD_BRANCH := BD_BRANCH,
+        CE_SIGN := CE_Sign,
+        AF_HorizontalEnc_deg := AF_HorizontalEnc_deg,
+        AF_CHOffset_deg := AF_CHOffset_deg,
+        AF_EncDir_CH := AF_EncDir_CH,
+        GeoMargin_m := GeoMargin_m
+    );
+    CEHI_Dis_AF_Neg_m := F_Calc_CEHI_Dis_m(
+        BD_Enc_mm := BD_ActEnc,
+        AC_Enc_deg := AC_ActEnc,
+        AF_Enc_deg := AF_ActEnc - CEHI_TestStep_AF_deg,
+        BD_KinOffset_mm := BD_KinOffset_mm,
+        AC_EncRef_deg := AC_EncRef_deg,
+        AC_ThetaRef_deg := AC_ThetaRef_deg,
+        Ax0 := Ax0,
+        Az0 := Az0,
+        Bx0 := Bx0,
+        Bz0 := Bz0,
+        l_AC_m := l_AC,
+        l_CD_m := l_CD,
+        l_CE_m := l_CE,
+        qOffset_m := D_Offset_m,
+        l_CH_m := l_CH_m,
+        BD_BRANCH := BD_BRANCH,
+        CE_SIGN := CE_Sign,
+        AF_HorizontalEnc_deg := AF_HorizontalEnc_deg,
+        AF_CHOffset_deg := AF_CHOffset_deg,
+        AF_EncDir_CH := AF_EncDir_CH,
+        GeoMargin_m := GeoMargin_m
+    );
+
+        // 逐方向预测：
+        // 当前有效且未越界：候选只要不越过 MinSafe 就允许；
+        // 当前有效但已经小于 MinSafe：候选必须让距离增大才允许；
+        // 当前无效：只允许候选有效且回到 MinSafe 以上的方向。
+        bCEHI_AtLimit := bCEHI_NowGeoOK AND (CEHI_DisNow_m <= CEHI_DisMinSafe_m);
+        bCEHI_InvalidRecoveryMode := NOT bCEHI_NowGeoOK;
+        CEHI_Allow_BD_Pos := F_CEHI_CandidateAllow(
+            CurrentValid := bCEHI_NowGeoOK,
+            CurrentDis_m := CEHI_DisNow_m,
+            CandidateDis_m := CEHI_Dis_BD_Pos_m,
+            MinSafe_m := CEHI_DisMinSafe_m,
+            ImproveEps_m := CEHI_Eps_m//避免浮点误差,0.000001过滤极小变化
+        );
+
+        CEHI_Allow_BD_Neg := F_CEHI_CandidateAllow(
+            CurrentValid := bCEHI_NowGeoOK,
+            CurrentDis_m := CEHI_DisNow_m,
+            CandidateDis_m := CEHI_Dis_BD_Neg_m,
+            MinSafe_m := CEHI_DisMinSafe_m,
+            ImproveEps_m := CEHI_Eps_m
+        );
+
+        CEHI_Allow_AC_Pos := F_CEHI_CandidateAllow(
+            CurrentValid := bCEHI_NowGeoOK,
+            CurrentDis_m := CEHI_DisNow_m,
+            CandidateDis_m := CEHI_Dis_AC_Pos_m,
+            MinSafe_m := CEHI_DisMinSafe_m,
+            ImproveEps_m := CEHI_Eps_m
+        );
+
+        CEHI_Allow_AC_Neg := F_CEHI_CandidateAllow(
+            CurrentValid := bCEHI_NowGeoOK,
+            CurrentDis_m := CEHI_DisNow_m,
+            CandidateDis_m := CEHI_Dis_AC_Neg_m,
+            MinSafe_m := CEHI_DisMinSafe_m,
+            ImproveEps_m := CEHI_Eps_m
+        );
+
+        CEHI_Allow_AF_Pos := F_CEHI_CandidateAllow(
+            CurrentValid := bCEHI_NowGeoOK,
+            CurrentDis_m := CEHI_DisNow_m,
+            CandidateDis_m := CEHI_Dis_AF_Pos_m,
+            MinSafe_m := CEHI_DisMinSafe_m,
+            ImproveEps_m := CEHI_Eps_m
+        );
+
+        CEHI_Allow_AF_Neg := F_CEHI_CandidateAllow(
+            CurrentValid := bCEHI_NowGeoOK,
+            CurrentDis_m := CEHI_DisNow_m,
+            CandidateDis_m := CEHI_Dis_AF_Neg_m,
+            MinSafe_m := CEHI_DisMinSafe_m,
+            ImproveEps_m := CEHI_Eps_m
+        );
+    END_IF;
+
+    bCEHI_Block_BD_Pos := NOT CEHI_Allow_BD_Pos;
+    bCEHI_Block_BD_Neg := NOT CEHI_Allow_BD_Neg;
+    bCEHI_Block_AC_Pos := NOT CEHI_Allow_AC_Pos;
+    bCEHI_Block_AC_Neg := NOT CEHI_Allow_AC_Neg;
+    bCEHI_Block_AF_Pos := NOT CEHI_Allow_AF_Pos;
+    bCEHI_Block_AF_Neg := NOT CEHI_Allow_AF_Neg;
+
+    bCEHI_RecoveryAnyDir :=
+        CEHI_Allow_BD_Pos OR CEHI_Allow_BD_Neg OR
+        CEHI_Allow_AC_Pos OR CEHI_Allow_AC_Neg OR
+        CEHI_Allow_AF_Pos OR CEHI_Allow_AF_Neg;//检测是否有可动方向
+END_IF;
+
+
+
+// =============================================================
+// D. 轴使能
+// =============================================================
+axis1_power(
+    Axis := axis1,
+    // 轴1：急停或 bAxis1PowerEnable=FALSE 时断开使能。
+    // 断开使能后 axis1_power.Status 会变 FALSE，抱闸输出 axis1baozha 立即断开。
+    Enable := bAxis1PowerEnable AND bSafetyOK,
+    Enable_Positive := TRUE,
+    Enable_Negative := TRUE
+);
+
+// =============================================================
+// D1. 轴1 BD 电缸抱闸逻辑
+// axis1baozha 是发给继电器的信号：
+// TRUE  -> 继电器吸合，抱闸松开；
+// FALSE -> 继电器断开，抱闸合上。
+// =============================================================
+Axis1_EnableOK_ForBrake := axis1_power.Status;
+
+// 轴1抱闸用故障综合：
+// 急停、主动断开轴1使能、MC_Power 错误、轴1 Jog 错误、轴1外部给定 FB 错误，均合闸。
+Axis1_FaultForBrake :=
+    (NOT jitingjudge)
+    OR (NOT bAxis1PowerEnable)
+    OR axis1_power.Error
+    OR axis1_jogerror
+    OR fbExtEnableBD.Error
+    OR fbExtDisableBD.Error;
+
+// 只有轴1真实使能成功且无轴1相关异常时，才给继电器释放抱闸信号。
+Axis1_BrakeReleaseReq :=
+    Axis1_EnableOK_ForBrake
+    AND (NOT Axis1_FaultForBrake);
+
+// 继电器输出：TRUE 松闸，FALSE 抱闸。
+axis1baozha := Axis1_BrakeReleaseReq;
+
+// 抱闸释放后延时，避免抱闸刚松开时轴马上运动。
+tonAxis1BrakeReleaseDelay(
+    IN := axis1baozha,
+    PT := Axis1BrakeReleaseDelayTime
+);
+
+Axis1_BrakeReleased :=
+    axis1baozha
+    AND tonAxis1BrakeReleaseDelay.Q;
+
+// 轴1运动许可：抱闸释放且延时到，才允许 Jog 或力控外部位置给定。
+Axis1_BrakeMotionOK :=
+    Axis1_BrakeReleased
+    AND Axis1_EnableOK_ForBrake
+    AND (NOT Axis1_FaultForBrake);
+
+axis2_power(
+    Axis := axis2,
+    Enable := bSafetyOK,
+    Enable_Positive := TRUE,
+    Enable_Negative := TRUE
+);
+
+axis3_power(
+    Axis := axis3,
+    Enable := bSafetyOK,
+    Enable_Positive := TRUE,
+    Enable_Negative := TRUE
+);
+
+axis4_power(
+    Axis := axis4,
+    Enable := bSafetyOK,
+    Enable_Positive := TRUE,
+    Enable_Negative := TRUE
+);
+
+
+// =============================================================
+// E. 急停 Stop
+// =============================================================
+axis1stop(
+    Axis := axis1,
+    Execute := NOT jitingjudge,
+    Deceleration := 1000,
+    Jerk := 2250
+);
+
+axis2stop(
+    Axis := axis2,
+    Execute := NOT jitingjudge,
+    Deceleration := 1000,
+    Jerk := 2250
+);
+
+axis3stop(
+    Axis := axis3,
+    Execute := NOT jitingjudge,
+    Deceleration := 1000,
+    Jerk := 2250
+);
+
+axis4stop(
+    Axis := axis4,
+    Execute := NOT jitingjudge,
+    Deceleration := 1000,
+    Jerk := 2250
+);
+
+
+// =============================================================
+// E1. 急停恢复后 MC_Reset 与轴 Ready 判断
+// =============================================================
+// 只要安全恢复后仍存在 power/ext/jog 相关错误，就请求 Reset。
+IF bSafetyOK AND (
+    axis1_power.Error OR axis2_power.Error OR axis3_power.Error OR axis4_power.Error
+    OR axis1_jogerror OR axis2_jogerror OR axis3_jogerror OR axis4_jogerror
+    OR fbExtEnableBD.Error OR fbExtEnableAC.Error OR fbExtEnableAF.Error OR fbExtEnableYaw.Error
+    OR fbExtDisableBD.Error OR fbExtDisableAC.Error OR fbExtDisableAF.Error OR fbExtDisableYaw.Error
+) THEN
+    bNeedAxisReset := TRUE;
+END_IF;
+
+// 急停未恢复时不 Reset。恢复后如果需要 Reset，则保持 Execute，直到错误消失。
+bAxisResetExecute := bSafetyOK AND bNeedAxisReset;
+
+axis1_reset(Axis := axis1, Execute := bAxisResetExecute);
+axis2_reset(Axis := axis2, Execute := bAxisResetExecute);
+axis3_reset(Axis := axis3, Execute := bAxisResetExecute);
+axis4_reset(Axis := axis4, Execute := bAxisResetExecute);
+
+bAxisResetBusyAny := axis1_reset.Busy OR axis2_reset.Busy OR axis3_reset.Busy OR axis4_reset.Busy;
+bAxisResetErrorAny := axis1_reset.Error OR axis2_reset.Error OR axis3_reset.Error OR axis4_reset.Error;
+
+bAxesPowerOK :=
+    axis1_power.Status
+    AND axis2_power.Status
+    AND axis3_power.Status
+    AND axis4_power.Status;
+
+bAxesNoError :=
+    NOT axis1_power.Error
+    AND NOT axis2_power.Error
+    AND NOT axis3_power.Error
+    AND NOT axis4_power.Error
+    AND NOT axis1_jogerror
+    AND NOT axis2_jogerror
+    AND NOT axis3_jogerror
+    AND NOT axis4_jogerror
+    AND NOT bAxisResetErrorAny;
+
+IF bNeedAxisReset AND bSafetyOK AND bAxesNoError AND NOT bAxisResetBusyAny THEN
+    bNeedAxisReset := FALSE;
+END_IF;
+
+bAxesReadyForForce :=
+    bSafetyOK
+    AND bAxesPowerOK
+    AND bAxesNoError
+    AND NOT bNeedAxisReset
+    AND NOT bAxisResetBusyAny;
+
+// 急停恢复并完成 Reset 后，再次对齐目标位置。
+IF bSafetyOK AND bAxesReadyForForce AND NOT bAfterEStopInitDone THEN
+    BD_PosCmd_Enc := BD_ActEnc;
+    AC_PosCmd_Enc := AC_ActEnc;
+    AF_PosCmd_Enc := AF_ActEnc;
+    Yaw_PosCmd_Enc := Yaw_ActEnc;
+
+    BD_Vlast_enc_s := 0.0;
+    AC_Vlast_enc_s := 0.0;
+    AF_Vlast_enc_s := 0.0;
+    Yaw_Vlast_enc_s := 0.0;
+
+    bAfterEStopInitDone := TRUE;
+END_IF;
+
+
+// =============================================================
+// F. 力传感器原始值读取
+// =============================================================
+Fx_raw_N := Dir_Fx * DINT_TO_LREAL(FT_FxRaw_DINT) * Scale_F_N;
+Fy_raw_N := Dir_Fy * DINT_TO_LREAL(FT_FyRaw_DINT) * Scale_F_N;
+Fz_raw_N := Dir_Fz * DINT_TO_LREAL(FT_FzRaw_DINT) * Scale_F_N;
+Mx_raw_Nm := Dir_Mx * DINT_TO_LREAL(FT_MxRaw_DINT) * Scale_M_Nm;
+My_raw_Nm := Dir_My * DINT_TO_LREAL(FT_MyRaw_DINT) * Scale_M_Nm;
+Mz_raw_Nm := Dir_Mz * DINT_TO_LREAL(FT_MzRaw_DINT) * Scale_M_Nm;
+
+// =============================================================
+// F1. AF 姿态、总空载偏置模型、力/力矩坐标变换角
+// =============================================================
+// 重要顺序：
+//   raw -> S 坐标系内扣总空载 bias -> 扣在线零偏
+//   -> Fhuman_S/Mhuman_S -> 力/力矩坐标变换 -> 导纳控制。
+// 不要先把 raw 转到基坐标再扣补偿。
+// =============================================================
+
+// 1) 总偏置拟合角：AF=115° 竖直为 0°，AF=205° 水平为 +90°
+//    最新确认：AF=70° 时末端俯仰约 135°，即 q=-45°
+AF_BiasRel_deg := AF_ActEnc - AF_VerticalEnc_deg;
+AF_BiasRel_rad := AF_BiasRel_deg * DEG2RAD;
+cAF_Bias := COS(AF_BiasRel_rad);
+sAF_Bias := SIN(AF_BiasRel_rad);
+
+// 2) AC/BD 平面力方向变换角：同样以 115° 为力方向零位
+AF_ForceRel_deg := AF_ActEnc - AF_ForceRefEnc_deg;
+AF_ForceRel_rad := AF_ForceRel_deg * DEG2RAD;
+cAF_Force := COS(AF_ForceRel_rad);
+sAF_Force := SIN(AF_ForceRel_rad);
+
+// 3) 底座 yaw Tx/Ty 纯扭矩轴变换角：115° 时 yaw≈Tx；205° 时 yaw≈Ty
+YawMomentAngle_deg :=
+    YawAngleGain * (AF_ActEnc - AF_YawRefEnc_deg)
+  + YawMomentOffset_deg;
+YawMomentAngle_rad := YawMomentAngle_deg * DEG2RAD;
+cYawAxis := COS(YawMomentAngle_rad);
+sYawAxis := SIN(YawMomentAngle_rad);
+
+// 4) 监控角：ToolPitch=0 表示水平，ToolPitch=90 表示竖直
+AF_ToolPitch_deg := AF_HorizontalEnc_deg - AF_ActEnc;
+AF_MechAngle_deg := AF_ToolPitch_deg + AF_MechOffset_deg;
+
+ArmDev_deg := 0.0;
+YawDev_deg := 0.0;
+
+// 5) 物理重力理论监控：只用于 Watch/理论分析，不叠加进 bias
+HandleWeight_N := HandleMass_kg * Gravity_mps2;
+
+Fg_S_X_N := HandleWeight_N * cAF_Bias;
+Fg_S_Y_N := HandleWeight_N * sAF_Bias;
+Fg_S_Z_N := 0.0;
+
+Mg_S_X_Nm := HandleCG_y_m * Fg_S_Z_N - HandleCG_z_m * Fg_S_Y_N;
+Mg_S_Y_Nm := HandleCG_z_m * Fg_S_X_N - HandleCG_x_m * Fg_S_Z_N;
+Mg_S_Z_Nm := HandleCG_x_m * Fg_S_Y_N - HandleCG_y_m * Fg_S_X_N;
+
+// 6) 总空载偏置拟合模型
+// 注意：以下 Fx_res_ang_N 等变量名沿用旧代码，但现在含义是“总空载拟合偏置”。
+// 不要再把 Fg_S_* 或 Mg_S_* 加到 Fx_bias_N / Mx_bias_Nm 中。
+IF bUseHandleBiasModel AND bUseAngleFitBiasModel THEN
+    // 最新一阶总空载偏置模型，基于：AF=205 水平，AF=70 对应末端 135°。
+    // 数据处理假设：Scale_F_N=0.001，Scale_M_Nm=0.001；同一 AF 点先平均，再拟合。
+    // 模型：bias = a0 + a1*COS(q) + a2*SIN(q)+a3*SIN(2q)，q=(AF_ActEnc-115)*DEG2RAD。
+    Fx_res_ang_N  := -79.137691 + 6.109784 * cAF_Bias + 0.438466 * sAF_Bias;
+    Fy_res_ang_N  := 197.304669 - 0.419128 * cAF_Bias + 8.305657 * sAF_Bias;
+    Fz_res_ang_N  :=  22.417806 - 0.902670 * cAF_Bias- 1.230326 * sAF_Bias;
+
+    Mx_res_ang_Nm :=   -101.433470 + 0.250073 * cAF_Bias - 6.283338 * sAF_Bias;
+    My_res_ang_Nm :=    1.493775 + 0.224870 * cAF_Bias + 0.005423 * sAF_Bias;
+    Mz_res_ang_Nm :=  -0.240972 - 0.010330 * cAF_Bias- 0.012701 * sAF_Bias;
+
+    Fx_bias_N  := Fx_res_ang_N;
+    Fy_bias_N  := Fy_res_ang_N;
+    Fz_bias_N  := Fz_res_ang_N;
+
+    Mx_bias_Nm := Mx_res_ang_Nm;
+    My_bias_Nm := My_res_ang_Nm;
+    Mz_bias_Nm := Mz_res_ang_Nm;
+ELSE
+    Fx_res_ang_N := 0.0;
+    Fy_res_ang_N := 0.0;
+    Fz_res_ang_N := 0.0;
+    Mx_res_ang_Nm := 0.0;
+    My_res_ang_Nm := 0.0;
+    Mz_res_ang_Nm := 0.0;
+
+    Fx_bias_N := 0.0;
+    Fy_bias_N := 0.0;
+    Fz_bias_N := 0.0;
+
+    Mx_bias_Nm := 0.0;
+    My_bias_Nm := 0.0;
+    Mz_bias_Nm := 0.0;
+END_IF;
+
+// 7) raw - bias 中间量：清零和运行时统一使用这些量
+Fx_afterBias_N  := Fx_raw_N  - Fx_bias_N;
+Fy_afterBias_N  := Fy_raw_N  - Fy_bias_N;
+Fz_afterBias_N  := Fz_raw_N  - Fz_bias_N;
+
+Mx_afterBias_Nm := Mx_raw_Nm - Mx_bias_Nm;
+My_afterBias_Nm := My_raw_Nm - My_bias_Nm;
+Mz_afterBias_Nm := Mz_raw_Nm - Mz_bias_Nm;
+
+
+// =============================================================
+// G. 进入力控时初始化
+// =============================================================
+// 注意：急停恢复不会自动产生 bForceRise。
+// 只有在急停后先松开力控开关、再重新按入力控，才会重新进入这里。
+IF bForceRise THEN
+    BD_PosCmd_Enc := BD_ActEnc;
+    AC_PosCmd_Enc := AC_ActEnc;
+    AF_PosCmd_Enc := AF_ActEnc;
+    Yaw_PosCmd_Enc := Yaw_ActEnc;
+
+    // 记录模型补偿后的残余零偏，而不是直接把原始值当零点
+	//相当于人工记录了一次零点
+    bFx_N := Fx_afterBias_N;
+    bFy_N := Fy_afterBias_N;
+    bFz_N := Fz_afterBias_N;
+    bMx_Nm := Mx_afterBias_Nm;
+    bMy_Nm := My_afterBias_Nm;
+    bMz_Nm := Mz_afterBias_Nm;
+
+    bZeroDone := TRUE;
+
+    Fx_filt := 0.0;
+    Fz_filt := 0.0;
+    Mx_filt := 0.0;
+    Mz_filt := 0.0;
+    Myaw_filt_Nm := 0.0;
+    Myaw_work_Nm := 0.0;
+    bXIntent := FALSE;
+    bZIntent := FALSE;
+    bXDriveActive := FALSE;
+    bZDriveActive := FALSE;
+    Fx_work_target := 0.0;
+    Fz_work_target := 0.0;
+    Fx_work := 0.0;
+    Fz_work := 0.0;
+    Mx_work_Nm := 0.0;
+    Mz_work_Nm := 0.0;
+    Mx_lever_Nm := 0.0;
+    My_lever_Nm := 0.0;
+    Mz_lever_Nm := 0.0;
+    Mx_pure_Nm := 0.0;
+    My_pure_Nm := 0.0;
+    Mz_pure_Nm := 0.0;
+    Mx_yaw_use_Nm := 0.0;
+    My_yaw_use_Nm := 0.0;
+    Myaw_raw_beforeGate_Nm := 0.0;
+    Myaw_gate_Nm := 0.0;
+    Myaw_parallel_Nm := 0.0;
+    Myaw_perp_Nm := 0.0;
+    Myaw_absParallel_Nm := 0.0;
+    Myaw_absPerp_Nm := 0.0;
+    Myaw_axisErrRatio := 0.0;
+    YawAlignLimit_Nm := 0.0;
+    bYawAxisAligned := FALSE;
+    FtransMag_N := 0.0;
+    YawTransBlockLimit_Nm := 0.0;
+    bYawBlockedByTrans := FALSE;
+    MDead_Yaw_Dyn := MDead_Yaw_Base;
+    FzYaw_raw_N := 0.0;
+    FzYaw_rawFilt_N := 0.0;
+    FzYaw_transMag_N := 0.0;
+    FzYaw_transIntent := 0.0;
+    FzYaw_pollutionEst_N := 0.0;
+    FzYaw_afterComp_N := 0.0;
+    FzYaw_softScale := 1.0;
+    FzYaw_clean_N := 0.0;
+    FzYaw_filt_N := 0.0;
+    FzYaw_work_N := 0.0;
+    AF_BlendPoll := 0.0;
+    FzPollIn_X_N := 0.0;
+    FzPollIn_Z_N := 0.0;
+    FzPollMag_N := 0.0;
+    FzPollIntent := 0.0;
+    Kx_AF := 0.0;
+    Kz_AF := 0.0;
+    KabsX_AF := 0.0;
+    KabsZ_AF := 0.0;
+    FzYawPollRaw_N := 0.0;
+    FzYawPollUsed_N := 0.0;
+    Vnorm_PreLimit_mps := 0.0;
+    Vnorm_AfterLimit_mps := 0.0;
+    ScaleVel_Plane := 1.0;
+    ScaleVel_Axis := 1.0;
+    ScaleAcc_Axis := 1.0;
+    PitchIntent := 0.0;
+    YawIntent := 0.0;
+    RotIntent := 0.0;
+    TransWeight_X := 1.0;
+    TransWeight_Z := 1.0;
+
+    Vx_mps := 0.0;
+    Vz_mps := 0.0;
+    Vx_last_mps := 0.0;
+    Vz_last_mps := 0.0;
+
+    BD_Vcmd_enc_s := 0.0;
+    AC_Vcmd_enc_s := 0.0;
+    AF_Vcmd_enc_s := 0.0;
+    BD_Vlast_enc_s := 0.0;
+    AC_Vlast_enc_s := 0.0;
+    AF_Vlast_enc_s := 0.0;
+
+    BD_Acmd_enc_s2 := 0.0;
+    AC_Acmd_enc_s2 := 0.0;
+    AF_Acmd_enc_s2 := 0.0;
+    AF_W_enc_s := 0.0;
+    AF_W_last_enc_s := 0.0;
+    AF_Alpha_enc_s2 := 0.0;
+    Yaw_Vcmd_enc_s := 0.0;
+    Yaw_Vlast_enc_s := 0.0;
+    Yaw_Acmd_enc_s2 := 0.0;
+    Yaw_W_enc_s := 0.0;
+    Yaw_W_last_enc_s := 0.0;
+    Yaw_Alpha_enc_s2 := 0.0;
+END_IF;
+
+
+// =============================================================
+// H. 手动清零力传感器
+// =============================================================
+IF bZeroRise THEN
+    // 清零只记录补偿模型后的残余值，即 zeroResidual = raw - bias_model。
+    // Fz 当前只监控，但仍记录残差，方便 Watch 判断预紧/线缆变化。
+    bFx_N := Fx_afterBias_N;
+    bFy_N := Fy_afterBias_N;
+    bFz_N := Fz_afterBias_N;
+    bMx_Nm := Mx_afterBias_Nm;
+    bMy_Nm := My_afterBias_Nm;
+    bMz_Nm := Mz_afterBias_Nm;
+
+    Fx_filt := 0.0;
+    Fz_filt := 0.0;
+    Mx_filt := 0.0;
+    Mz_filt := 0.0;
+    Myaw_filt_Nm := 0.0;
+    Myaw_work_Nm := 0.0;
+    bXIntent := FALSE;
+    bZIntent := FALSE;
+    bXDriveActive := FALSE;
+    bZDriveActive := FALSE;
+    Fx_work_target := 0.0;
+    Fz_work_target := 0.0;
+    Fx_work := 0.0;
+    Fz_work := 0.0;
+    Mx_work_Nm := 0.0;
+    Mz_work_Nm := 0.0;
+    Mx_lever_Nm := 0.0;
+    My_lever_Nm := 0.0;
+    Mz_lever_Nm := 0.0;
+    Mx_pure_Nm := 0.0;
+    My_pure_Nm := 0.0;
+    Mz_pure_Nm := 0.0;
+    Mx_yaw_use_Nm := 0.0;
+    My_yaw_use_Nm := 0.0;
+    Myaw_raw_beforeGate_Nm := 0.0;
+    Myaw_gate_Nm := 0.0;
+    Myaw_parallel_Nm := 0.0;
+    Myaw_perp_Nm := 0.0;
+    Myaw_absParallel_Nm := 0.0;
+    Myaw_absPerp_Nm := 0.0;
+    Myaw_axisErrRatio := 0.0;
+    YawAlignLimit_Nm := 0.0;
+    bYawAxisAligned := FALSE;
+    FtransMag_N := 0.0;
+    YawTransBlockLimit_Nm := 0.0;
+    bYawBlockedByTrans := FALSE;
+    MDead_Yaw_Dyn := MDead_Yaw_Base;
+    FzYaw_raw_N := 0.0;
+    FzYaw_rawFilt_N := 0.0;
+    FzYaw_transMag_N := 0.0;
+    FzYaw_transIntent := 0.0;
+    FzYaw_pollutionEst_N := 0.0;
+    FzYaw_afterComp_N := 0.0;
+    FzYaw_softScale := 1.0;
+    FzYaw_clean_N := 0.0;
+    FzYaw_filt_N := 0.0;
+    FzYaw_work_N := 0.0;
+    AF_BlendPoll := 0.0;
+    FzPollIn_X_N := 0.0;
+    FzPollIn_Z_N := 0.0;
+    FzPollMag_N := 0.0;
+    FzPollIntent := 0.0;
+    Kx_AF := 0.0;
+    Kz_AF := 0.0;
+    KabsX_AF := 0.0;
+    KabsZ_AF := 0.0;
+    FzYawPollRaw_N := 0.0;
+    FzYawPollUsed_N := 0.0;
+    Vnorm_PreLimit_mps := 0.0;
+    Vnorm_AfterLimit_mps := 0.0;
+    ScaleVel_Plane := 1.0;
+    ScaleVel_Axis := 1.0;
+    ScaleAcc_Axis := 1.0;
+    PitchIntent := 0.0;
+    YawIntent := 0.0;
+    RotIntent := 0.0;
+    TransWeight_X := 1.0;
+    TransWeight_Z := 1.0;
+
+    Vx_mps := 0.0;
+    Vz_mps := 0.0;
+    Vx_last_mps := 0.0;
+    Vz_last_mps := 0.0;
+    AF_W_enc_s := 0.0;
+    AF_W_last_enc_s := 0.0;
+    Yaw_W_enc_s := 0.0;
+    Yaw_W_last_enc_s := 0.0;
+    Myaw_filt_Nm := 0.0;
+    Myaw_work_Nm := 0.0;
+
+    bZeroDone := TRUE;
+END_IF;
+
+
+// =============================================================
+// I. 扣零后的人手外力 / 外力矩
+// =============================================================
+Fhuman_S_X := Fx_afterBias_N - bFx_N;//bFx是人工记录无外力的零点
+Fhuman_S_Y := Fy_afterBias_N - bFy_N;
+// Fz 当前不建模、不参与控制，只保留监控。
+Fhuman_S_Z := Fz_afterBias_N - bFz_N;
+Mhuman_S_X := Mx_afterBias_Nm - bMx_Nm;
+Mhuman_S_Y := My_afterBias_Nm - bMy_Nm;
+Mhuman_S_Z := Mz_afterBias_Nm - bMz_Nm;
+
+
+// =============================================================
+// I2. 人手作用点 Ph×F 力臂解耦：得到 yaw 可用纯扭矩
+// =============================================================
+// 目的：底座 yaw 使用 Tx/Ty 的纯扭矩意图，而不是平移力通过 110 mm 力臂产生的附加力矩。
+// 计算必须在传感器坐标系 S 内完成，使用补偿后、死区前的 Fhuman_S / Mhuman_S。
+// YawLeverCompRatio=1.0 为完全纯扭矩；0.0 为不扣 Ph×F；中间值为部分解耦。
+// =============================================================
+Fdec_S_X := Fhuman_S_X;
+Fdec_S_Y := Fhuman_S_Y;
+Fdec_S_Z := Fhuman_S_Z;
+
+IF bUseFzForMxLever THEN //Z通道开关
+    Fz_for_lever_N := Fhuman_S_Z;
+ELSE
+    Fz_for_lever_N := 0.0;
+END_IF;
+
+// Ph×F，Ph=[Ph_x_m, Ph_y_m, Ph_z_m]，F=[Fdec_S_X, Fdec_S_Y, Fdec_S_Z]
+Mx_lever_Nm := Ph_y_m * Fz_for_lever_N - Ph_z_m * Fdec_S_Y;
+My_lever_Nm := Ph_z_m * Fdec_S_X - Ph_x_m * Fz_for_lever_N;
+Mz_lever_Nm := Ph_x_m * Fdec_S_Y - Ph_y_m * Fdec_S_X;
+
+// 完全扣除力臂后的纯扭矩，供 Watch 观察
+Mx_pure_Nm := Mhuman_S_X - Mx_lever_Nm;
+My_pure_Nm := Mhuman_S_Y - My_lever_Nm;
+Mz_pure_Nm := Mhuman_S_Z - Mz_lever_Nm;
+
+// yaw 实际使用的力矩，可通过 YawLeverCompRatio 调整纯扭矩程度
+Mx_yaw_use_Nm := Mhuman_S_X - YawLeverCompRatio * Mx_lever_Nm;
+My_yaw_use_Nm := Mhuman_S_Y - YawLeverCompRatio * My_lever_Nm;
+
+
+// =============================================================
+// J. 当前传感器安装关系下的力映射
+// Xs = -ZB
+// Ys = +XB
+// Zs = +YB
+// 使用 Fdec_S_*，不是直接用 Fhuman_S_*
+// =============================================================
+IF bUseAFForForceMap THEN
+    // 当前确认：AF_ForceRel=0 时 Xs=-ZB, Ys=+XB, Zs=+YB。
+    // 因此零位映射为 Fx_ext=+Fdec_S_Y，Fz_ext=-Fdec_S_X。
+    // AF_ForceRel 用于补偿 AF 相对该零位转动后的 X/Z 平面力投影。
+    Fx_ext_N     := Dir_FxPlane * (-sAF_Force * Fdec_S_X + cAF_Force * Fdec_S_Y);
+    Fz_ext_N     := Dir_FzPlane * (-cAF_Force * Fdec_S_X - sAF_Force * Fdec_S_Y);
+    Fy_lateral_N := Fdec_S_Z;      // Zs=+YB；当前仅监控，不参与控制
+ELSE
+    // 调试初期可用固定映射验证方向
+    Fx_ext_N     := Dir_FxPlane * Fdec_S_Y;
+    Fz_ext_N     := Dir_FzPlane * (-Fdec_S_X);
+    Fy_lateral_N := Fdec_S_Z;
+END_IF;
+
+
+// =============================================================
+// K. 滤波与死区
+// =============================================================
+Fx_filt := Alpha * Fx_ext_N + (1.0 - Alpha) * Fx_filt;
+Fz_filt := Alpha * Fz_ext_N + (1.0 - Alpha) * Fz_filt;
+
+// =============================================================
+// X/Z 平面软死区
+// 逻辑：
+// 1) 意图状态保留启动/退出滞回，但不代表本周期仍有有效驱动力；
+// 2) 实际扣除量 >= 启动阈值，2~3.2N 的残余力不再持续驱动；
+// 3) 低于完整死区时立即清零工作力，导纳切换停车阻尼；
+// 4) 有效驱动力只在超出死区时平滑建立，轴速度仍经原加减速度限幅。
+// =============================================================
+FDeadSubUse_X_N := MAX(0.0, MAX(FDeadSub_X_N, FIntentEnter_X_N));
+FDeadSubUse_Z_N := MAX(0.0, MAX(FDeadSub_Z_N, FIntentEnter_Z_N));
+
+// ------------------------------
+// X 通道
+// ------------------------------
+Fx_abs_N := ABS(Fx_filt);
+
+IF NOT bForceMode OR NOT bZeroDone OR NOT bSafetyOK THEN
+    bXIntent := FALSE;
+ELSIF bXIntent THEN
+    IF Fx_abs_N <= FIntentExit_X_N THEN
+        bXIntent := FALSE;
+    END_IF;
+ELSE
+    IF Fx_abs_N >= FIntentEnter_X_N THEN
+        bXIntent := TRUE;
+    END_IF;
+END_IF;
+
+bXDriveActive := bXIntent AND (Fx_abs_N > FDeadSubUse_X_N);
+IF bXDriveActive THEN
+    IF Fx_filt > 0.0 THEN
+        Fx_work_target := Fx_abs_N - FDeadSubUse_X_N;
+    ELSE
+        Fx_work_target := -(Fx_abs_N - FDeadSubUse_X_N);
+    END_IF;
+    Fx_work := Fx_work + WorkFiltAlpha_X * (Fx_work_target - Fx_work);
+ELSE
+    Fx_work_target := 0.0;
+    Fx_work := 0.0;
+END_IF;
+
+// ------------------------------
+// Z 通道
+// ------------------------------
+Fz_abs_N := ABS(Fz_filt);
+
+IF NOT bForceMode OR NOT bZeroDone OR NOT bSafetyOK THEN
+    bZIntent := FALSE;
+ELSIF bZIntent THEN
+    IF Fz_abs_N <= FIntentExit_Z_N THEN
+        bZIntent := FALSE;
+    END_IF;
+ELSE
+    IF Fz_abs_N >= FIntentEnter_Z_N THEN
+        bZIntent := TRUE;
+    END_IF;
+END_IF;
+
+bZDriveActive := bZIntent AND (Fz_abs_N > FDeadSubUse_Z_N);
+IF bZDriveActive THEN
+    IF Fz_filt > 0.0 THEN
+        Fz_work_target := Fz_abs_N - FDeadSubUse_Z_N;
+    ELSE
+        Fz_work_target := -(Fz_abs_N - FDeadSubUse_Z_N);
+    END_IF;
+    Fz_work := Fz_work + WorkFiltAlpha_Z * (Fz_work_target - Fz_work);
+ELSE
+    Fz_work_target := 0.0;
+    Fz_work := 0.0;
+END_IF;
+
+// AF 俯仰：拧把手对应 Tz/Mz，直接使用补偿后 Mhuman_S_Z。
+MAF_raw_Nm := Mhuman_S_Z;
+Mz_filt := Alpha * MAF_raw_Nm + (1.0 - Alpha) * Mz_filt;
+
+IF Mz_filt > MDead_Z THEN
+    Mz_work_Nm := Mz_filt - MDead_Z;
+ELSIF Mz_filt < -MDead_Z THEN
+    Mz_work_Nm := Mz_filt + MDead_Z;
+ELSE
+    Mz_work_Nm := 0.0;
+END_IF;
+
+// 底座 yaw / 第三平移自由度模拟：优先使用传感器 Zs 通道。
+// =============================================================
+// 当前控制目标改变：
+// 1) 为了模仿末端 3 自由度平移，底座 yaw 不再使用 Mx/My 组合扭矩作为主输入；
+// 2) yaw 改由 Fhuman_S_Z 控制，把底座回转当作横向/第三方向平移的执行近似；
+// 3) raw Fz 空载 37~39N 是预紧/安装偏置，不直接用于控制；
+//    只使用 Fhuman_S_Z = Fz_afterBias_N - bFz_N。
+// 4) 平面直推会污染 Zs 通道，所以用 Fhuman_S_X/Y 建立污染估计并扣除。
+// =============================================================
+
+// ------------------------------
+// A) 保留 Mx/My 到基座 Z 轴的计算，仅用于 Watch 对比，不再作为 yaw 主输入。
+// ------------------------------
+Myaw_parallel_Nm :=
+    cYawAxis * Mx_yaw_use_Nm
+  + YawMixSign * sYawAxis * My_yaw_use_Nm;
+
+Myaw_perp_Nm :=
+   -YawMixSign * sYawAxis * Mx_yaw_use_Nm
+  + cYawAxis * My_yaw_use_Nm;
+
+Myaw_raw_beforeGate_Nm := Myaw_parallel_Nm;
+Myaw_absParallel_Nm := ABS(Myaw_parallel_Nm);
+Myaw_absPerp_Nm := ABS(Myaw_perp_Nm);
+
+IF Myaw_absParallel_Nm > 0.001 THEN//防止除0崩溃
+    Myaw_axisErrRatio := Myaw_absPerp_Nm / Myaw_absParallel_Nm;
+ELSE
+    Myaw_axisErrRatio := 0.0;
+END_IF;
+
+YawAlignLimit_Nm := YawPerpBase_Nm + YawPerpRatio * Myaw_absParallel_Nm;
+bYawAxisAligned := Myaw_absPerp_Nm <= YawAlignLimit_Nm;
+
+// ------------------------------
+// B) Zs 通道作为 yaw / 第三平移自由度输入。
+//    新版：用 Fx_filt/Fz_filt + AF 姿态插值模型估计并扣除平移对 Zs 的污染。
+// ------------------------------
+IF bUseFzChannelForYaw THEN
+
+    // 1. 使用清零后的 Zs 人手力，不使用 raw Fz。
+    //    Fz_raw_N 空载 35~39N 是预紧/安装偏置，不可直接进入 yaw。
+    FzYaw_raw_N := Fhuman_S_Z;
+    FzYaw_rawFilt_N := Alpha * FzYaw_raw_N + (1.0 - Alpha) * FzYaw_rawFilt_N;
+
+    // 2. 污染模型输入使用死区前平面力 Fx_filt/Fz_filt。
+    //    原因：平移污染在死区前已经进入 Fhuman_S_Z；
+    //    如果用 Fx_work/Fz_work，会漏掉小平移力造成的 Zs 污染。
+    FzPollIn_X_N := Fx_filt;
+    FzPollIn_Z_N := Fz_filt;
+
+    FzPollMag_N := SQRT(
+        FzPollIn_X_N * FzPollIn_X_N
+      + FzPollIn_Z_N * FzPollIn_Z_N
+    );
+
+    // 兼容旧 Watch 变量。
+    FzYaw_transMag_N := FzPollMag_N;
+    FtransMag_N := FzPollMag_N;
+
+    // 3. 平移力强度监控。线性串扰项本身随平面力归零，不再额外渐入或撤力时提前关断。
+    IF FzPollMag_N <= FzPollStart_N THEN
+        FzPollIntent := 0.0;
+    ELSIF FzPollMag_N >= FzPollFull_N THEN
+        FzPollIntent := 1.0;
+    ELSE
+        FzPollIntent :=
+            (FzPollMag_N - FzPollStart_N)
+          / (FzPollFull_N - FzPollStart_N);
+    END_IF;
+
+    FzYaw_transIntent := FzPollIntent;
+    // 4. AF 姿态插值。
+    //    AF_VerticalEnc_deg：竖直系数；AF_HorizontalEnc_deg：水平系数。
+    //    中间角度线性插值。先用线性插值，不建议一开始上高阶模型。
+    IF ABS(AF_HorizontalEnc_deg - AF_VerticalEnc_deg) > 0.001 THEN
+        AF_BlendPoll :=
+            (AF_ActEnc - AF_VerticalEnc_deg)
+          / (AF_HorizontalEnc_deg - AF_VerticalEnc_deg);
+    ELSE
+        AF_BlendPoll := 0.0;
+    END_IF;
+
+    IF AF_BlendPoll < 0.0 THEN
+        AF_BlendPoll := 0.0;
+    ELSIF AF_BlendPoll > 1.0 THEN
+        AF_BlendPoll := 1.0;
+    END_IF;
+
+    Kx_AF :=
+        Kx_Vertical
+      + AF_BlendPoll * (Kx_Horizontal - Kx_Vertical);
+
+    Kz_AF :=
+        Kz_Vertical
+      + AF_BlendPoll * (Kz_Horizontal - Kz_Vertical);
+
+    KabsX_AF :=
+        KabsX_Vertical
+      + AF_BlendPoll * (KabsX_Horizontal - KabsX_Vertical);
+
+    KabsZ_AF :=
+        KabsZ_Vertical
+      + AF_BlendPoll * (KabsZ_Horizontal - KabsZ_Vertical);
+
+    // 5. 平移对 Fhuman_S_Z 的污染估计。
+    //    注意：允许 FzYawPollRaw_N 为正或负，不能再限制为正。
+    //    空载 Fhuman_S_Z 已经接近 0，因此这里不再加入固定大 Bias。
+    FzYawPollRaw_N :=
+          Kx_AF    * FzPollIn_X_N
+        + Kz_AF    * FzPollIn_Z_N
+        + KabsX_AF * ABS(FzPollIn_X_N)
+        + KabsZ_AF * ABS(FzPollIn_Z_N);
+
+    
+    FzYaw_pollutionEst_N := FzYawPollRaw_N;
+
+    // 6. 模型补偿量。
+    //    注意：当前模型只能描述平均趋势，不要长期满补偿。
+    //    建议 FzYawCompRatio=0.60~0.80；平移污染特别明显再临时提高。
+    FzYawPollUsed_N := FzYawCompRatio * FzYawPollRaw_N;
+
+    // 7. 模型补偿后的候选 Zs/yaw 输入。
+    //    Zs 与平面输入均已进行一次同级滤波，再相减，减小推力释放时的时序误差。
+    FzYawCandidate_N := FzYaw_rawFilt_N - FzYawPollUsed_N;
+    FzYaw_afterComp_N := FzYawCandidate_N;
+
+    // 8. 动态死区。
+    //    平面 X/Z 力越大，说明越可能是在直推平移，Zs 通道需要更大的剩余力才允许驱动底座 yaw。
+    FzYawDeadDyn_N :=
+        FzYawDeadBase_N
+      + FzYawDeadPerPlane * FzPollMag_N;
+
+    IF FzYawDeadDyn_N > FzYawDeadMax_N THEN
+        FzYawDeadDyn_N := FzYawDeadMax_N;
+    END_IF;
+
+    // 保留旧变量名用于 Watch：此时 FzYawDead_N 不再参与计算，只显示基础死区。
+    FzYawDead_N := FzYawDeadBase_N;
+
+    // 9. 本版不再额外按平移强度软衰减。
+    //    抑制污染主要由“模型补偿 + 动态死区”完成，避免双重削弱真正 Zs/yaw 意图。
+    FzYaw_softScale := 1.0;
+    FzYaw_clean_N := FzYawCandidate_N;
+
+    // 10. Zs 与平面力已同级滤波；直接输出补偿结果，避免纯 Zs 操作增加一级延迟。
+    FzYaw_filt_N := FzYaw_clean_N;
+
+    // 11. 动态死区输出。
+    IF FzYaw_filt_N > FzYawDeadDyn_N THEN
+        FzYaw_work_N := FzYaw_filt_N - FzYawDeadDyn_N;
+    ELSIF FzYaw_filt_N < -FzYawDeadDyn_N THEN
+        FzYaw_work_N := FzYaw_filt_N + FzYawDeadDyn_N;
+    ELSE
+        FzYaw_work_N := 0.0;
+    END_IF;
+
+    // 12. 复用原 yaw 导纳变量。
+    //     Myaw_work_Nm / Mx_work_Nm 现在表示“由 Zs 力生成的 yaw 虚拟输入”，不是真实 Mx 扭矩。
+    Myaw_raw_Nm := Dir_FzYaw * FzYaw_clean_N * FzYawToYaw_NmPerN;
+    Myaw_gate_Nm := Myaw_raw_Nm;
+    Myaw_filt_Nm := Dir_FzYaw * FzYaw_filt_N * FzYawToYaw_NmPerN;
+    MDead_Yaw_Dyn := FzYawDeadDyn_N * FzYawToYaw_NmPerN;
+    Myaw_work_Nm := Dir_FzYaw * FzYaw_work_N * FzYawToYaw_NmPerN;
+
+    Mx_work_Nm := Myaw_work_Nm;
+    bYawBlockedByTrans := (FzPollIntent > 0.0) AND (FzYaw_work_N = 0.0);
+
+ELSE
+    // 关闭 Zs 通道时清除其滤波记忆，重新启用后从零开始。
+    FzYaw_rawFilt_N := 0.0;
+    FzYaw_filt_N := 0.0;
+    FzYaw_work_N := 0.0;
+
+    // 备用：保留原来的 Mx/My 组合扭矩 yaw 控制。
+    FtransMag_N := SQRT(Fx_work * Fx_work + Fz_work * Fz_work);
+
+    YawTransBlockLimit_Nm := YawTransBlockBase_Nm + YawTransBlockPerN * FtransMag_N;
+    IF YawTransBlockLimit_Nm > YawTransBlockMax_Nm THEN
+        YawTransBlockLimit_Nm := YawTransBlockMax_Nm;
+    END_IF;
+
+    Myaw_absRaw_Nm := ABS(Myaw_parallel_Nm);
+
+    IF Myaw_parallel_Nm >= 0.0 THEN
+        Myaw_gateSign := 1.0;
+    ELSE
+        Myaw_gateSign := -1.0;
+    END_IF;
+
+    IF bUseYawTransBlock THEN
+        Myaw_transResidual_Nm := Myaw_absRaw_Nm - YawTransBlockLimit_Nm;
+
+        IF Myaw_transResidual_Nm > 0.0 THEN
+            Myaw_gate_Nm := Myaw_gateSign * Myaw_transResidual_Nm;
+            bYawBlockedByTrans := FALSE;
+        ELSE
+            Myaw_gate_Nm := 0.0;
+            bYawBlockedByTrans := TRUE;
+        END_IF;
+    ELSE
+        Myaw_transResidual_Nm := Myaw_absRaw_Nm;
+        Myaw_gate_Nm := Myaw_parallel_Nm;
+        bYawBlockedByTrans := FALSE;
+    END_IF;
+
+    Myaw_raw_Nm := Myaw_gate_Nm;
+    Myaw_filt_Nm := Alpha * Myaw_raw_Nm + (1.0 - Alpha) * Myaw_filt_Nm;
+
+    MDead_Yaw_Dyn := MDead_Yaw_Base + MDead_Yaw_PerN * FtransMag_N;
+    IF MDead_Yaw_Dyn > MDead_Yaw_Max THEN
+        MDead_Yaw_Dyn := MDead_Yaw_Max;
+    END_IF;
+
+    IF Myaw_filt_Nm > MDead_Yaw_Dyn THEN
+        Myaw_work_Nm := Myaw_filt_Nm - MDead_Yaw_Dyn;
+    ELSIF Myaw_filt_Nm < -MDead_Yaw_Dyn THEN
+        Myaw_work_Nm := Myaw_filt_Nm + MDead_Yaw_Dyn;
+    ELSE
+        Myaw_work_Nm := 0.0;
+    END_IF;
+
+    Mx_work_Nm := Myaw_work_Nm;
+END_IF;
+
+// 旋转明显时，不硬禁用 AC/BD；只对平移力输入做软衰减。
+// 使用 Myaw_work_Nm，而不是未门控的 Myaw_raw_beforeGate_Nm，避免直推污染反过来压低平移。
+IF ABS(Myaw_work_Nm) <= MxSoftStart_Nm THEN
+    YawIntent := 0.0;
+ELSIF ABS(Myaw_work_Nm) >= MxSoftFull_Nm THEN
+    YawIntent := 1.0;
+ELSE
+    YawIntent := (ABS(Myaw_work_Nm) - MxSoftStart_Nm) / (MxSoftFull_Nm - MxSoftStart_Nm);
+END_IF;
+
+IF ABS(MAF_raw_Nm) <= MzSoftStart_Nm THEN
+    PitchIntent := 0.0;
+ELSIF ABS(MAF_raw_Nm) >= MzSoftFull_Nm THEN
+    PitchIntent := 1.0;
+ELSE
+    PitchIntent := (ABS(MAF_raw_Nm) - MzSoftStart_Nm) / (MzSoftFull_Nm - MzSoftStart_Nm);
+END_IF;
+
+IF PitchIntent > YawIntent THEN
+    RotIntent := PitchIntent;
+ELSE
+    RotIntent := YawIntent;
+END_IF;
+
+TransWeight_X := 1.0 - RotIntent * (1.0 - TransWeightMin_X);
+TransWeight_Z := 1.0 - RotIntent * (1.0 - TransWeightMin_Z);
+
+
+// =============================================================
+// L. 手动 Jog 基础限位// L. 手动 Jog 基础限位
+// 力控模式下，所有 Jog 输入取消
+// =============================================================
+baxis1fwflag1 := FALSE;
+baxis1bwflag1 := FALSE;
+
+IF bManualMode AND jitingjudge THEN
+    // axis1 = BD，总限位 2~600
+    IF (axis1.NcToPlc.ActPos > BD_EncMax) AND bInput_axis1jogfw THEN
+        baxis1fwflag1 := FALSE;
+    ELSIF (axis1.NcToPlc.ActPos <= BD_EncMax) AND bInput_axis1jogfw THEN
+        baxis1fwflag1 := TRUE;
+    END_IF;
+
+    IF (axis1.NcToPlc.ActPos < BD_EncMin) AND bInput_axis1jogbw THEN
+        baxis1bwflag1 := FALSE;
+    ELSIF (axis1.NcToPlc.ActPos >= BD_EncMin) AND bInput_axis1jogbw THEN
+        baxis1bwflag1 := TRUE;
+    END_IF;
+
+    // 轴1必须抱闸释放并延时到，才允许手动 Jog。
+    IF Axis1_BrakeMotionOK THEN
+        ballow_axis1jogfw := baxis1fwflag1;
+        ballow_axis1jogbw := baxis1bwflag1;
+    ELSE
+        ballow_axis1jogfw := FALSE;
+        ballow_axis1jogbw := FALSE;
+    END_IF;
+
+    // axis2 = AC，
+    ballow_axis2jogfw := bInput_axis2jogfw;
+    ballow_axis2jogbw := bInput_axis2jogbw;
+
+    // axis3 = AF，基础版不加限位
+    ballow_axis3jogfw := bInput_axis3jogfw;
+    ballow_axis3jogbw := bInput_axis3jogbw;
+
+    // axis4 = 底座，限位 -30~90
+    IF (axis4.NcToPlc.ActPos > Base_EncMax) AND bInput_axis4jogfw THEN
+        ballow_axis4jogfw := FALSE;
+    ELSE
+        ballow_axis4jogfw := bInput_axis4jogfw;
+    END_IF;
+
+    IF (axis4.NcToPlc.ActPos < Base_EncMin) AND bInput_axis4jogbw THEN
+        ballow_axis4jogbw := FALSE;
+    ELSE
+        ballow_axis4jogbw := bInput_axis4jogbw;
+    END_IF;
+
+ELSE
+    ballow_axis1jogfw := FALSE;
+    ballow_axis1jogbw := FALSE;
+
+    ballow_axis2jogfw := FALSE;
+    ballow_axis2jogbw := FALSE;
+
+    ballow_axis3jogfw := FALSE;
+    ballow_axis3jogbw := FALSE;
+
+    ballow_axis4jogfw := FALSE;
+    ballow_axis4jogbw := FALSE;
+END_IF;
+
+
+
+
+// =============================================================
+// L1. 机构学限位对手动 Jog 的拦截
+// 放在 MC_Jog 调用之前；先判断，再允许点动
+// =============================================================
+// axis1 = BD，只受 CE-HI 距离限位影响
+IF bCEHI_Block_BD_Pos THEN
+    ballow_axis1jogfw := FALSE;
+END_IF;
+
+IF bCEHI_Block_BD_Neg THEN
+    ballow_axis1jogbw := FALSE;
+END_IF;
+
+// axis2 = AC，同时受 CAF 和 CE-HI 限位影响
+IF bCAF_Block_AC_Pos OR bCEHI_Block_AC_Pos THEN
+    ballow_axis2jogfw := FALSE;
+END_IF;
+
+IF bCAF_Block_AC_Neg OR bCEHI_Block_AC_Neg THEN
+    ballow_axis2jogbw := FALSE;
+END_IF;
+
+// axis3 = AF，同时受 CAF 和 CE-HI 限位影响
+// 你当前 axis3_jog 里 JogForward/JogBackwards 是反接：
+// JogForward := ballow_axis3jogbw，JogBackwards := ballow_axis3jogfw。
+// 因此按：ballow_axis3jogbw = AF 编码器增大；ballow_axis3jogfw = AF 编码器减小。
+IF bCAF_Block_AF_Pos OR bCEHI_Block_AF_Pos THEN
+    ballow_axis3jogbw := FALSE;
+END_IF;
+
+IF bCAF_Block_AF_Neg OR bCEHI_Block_AF_Neg THEN
+    ballow_axis3jogfw := FALSE;
+END_IF;
+
+
+// =============================================================
+// M. 手动 Jog 调用
+// =============================================================
+axis1_jog(
+    Axis := axis1,
+    JogForward := ballow_axis1jogfw,
+    JogBackwards := ballow_axis1jogbw,
+    Velocity := 1,
+    Done => axis1_jogdone,
+    Busy => axis1_jogbusy,
+    Error => axis1_jogerror,
+    ErrorID => axis1_jogerrorid
+);
+
+axis2_jog(
+    Axis := axis2,
+    JogForward := ballow_axis2jogfw,
+    JogBackwards := ballow_axis2jogbw,
+    Velocity := 1,
+    Done => axis2_jogdone,
+    Busy => axis2_jogbusy,
+    Error => axis2_jogerror,
+    ErrorID => axis2_jogerrorid
+);
+
+axis3_jog(
+    Axis := axis3,
+    JogForward := ballow_axis3jogbw,
+    JogBackwards := ballow_axis3jogfw,
+    Velocity := 1,
+    Done => axis3_jogdone,
+    Busy => axis3_jogbusy,
+    Error => axis3_jogerror,
+    ErrorID => axis3_jogerrorid
+);
+
+axis4_jog(
+    Axis := axis4,
+    JogForward := ballow_axis4jogfw,
+    JogBackwards := ballow_axis4jogbw,
+    Velocity := 1,
+    Done => axis4_jogdone,
+    Busy => axis4_jogbusy,
+    Error => axis4_jogerror,
+    ErrorID => axis4_jogerrorid
+);
+
+
+// =============================================================
+// N. 力控外部位置给定 Enable / Disable
+// =============================================================
+fbExtEnableBD(
+    Axis := axis1,
+    // 轴1抱闸未释放或释放延时未到时，不启用外部位置给定。
+    Execute := bForceMode AND bAxesReadyForForce AND axis1_power.Status AND Axis1_BrakeMotionOK AND NOT bExtBD,
+    Position := BD_PosCmd_Enc,
+    PositionType := POSITIONTYPE_ABSOLUTE,
+    Options := stExtOpt
+);
+
+fbExtEnableAC(
+    Axis := axis2,
+    Execute := bForceMode AND bAxesReadyForForce AND axis2_power.Status AND NOT bExtAC,
+    Position := AC_PosCmd_Enc,
+    PositionType := POSITIONTYPE_ABSOLUTE,
+    Options := stExtOpt
+);
+
+fbExtEnableAF(
+    Axis := axis3,
+    Execute := bForceMode AND bAxesReadyForForce AND axis3_power.Status AND NOT bExtAF,
+    Position := AF_PosCmd_Enc,
+    PositionType := POSITIONTYPE_ABSOLUTE,
+    Options := stExtOpt
+);
+
+fbExtEnableYaw(
+    Axis := axis4,
+    Execute := bForceMode AND bAxesReadyForForce AND axis4_power.Status AND NOT bExtYaw,
+    Position := Yaw_PosCmd_Enc,
+    PositionType := POSITIONTYPE_ABSOLUTE,
+    Options := stExtOpt
+);
+
+fbExtDisableBD(
+    Axis := axis1,
+    Execute := bForceFall OR bEStopActive OR bNeedAxisReset
+);
+
+fbExtDisableAC(
+    Axis := axis2,
+    Execute := bForceFall OR bEStopActive OR bNeedAxisReset
+);
+
+fbExtDisableAF(
+    Axis := axis3,
+    Execute := bForceFall OR bEStopActive OR bNeedAxisReset
+);
+
+fbExtDisableYaw(
+    Axis := axis4,
+    Execute := bForceFall OR bEStopActive OR bNeedAxisReset
+);
+
+bExtBD := fbExtEnableBD.Enabled;
+bExtAC := fbExtEnableAC.Enabled;
+bExtAF := fbExtEnableAF.Enabled;
+bExtYaw := fbExtEnableYaw.Enabled;
+
+bRunForce := bForceMode
+             AND bZeroDone
+             AND bAxesReadyForForce
+             AND axis1_power.Status
+             AND Axis1_BrakeMotionOK
+             AND axis2_power.Status
+             AND axis3_power.Status
+             AND axis4_power.Status
+             AND bExtBD
+             AND bExtAC
+             AND bExtAF
+             AND bExtYaw;
+
+// 未进入实际力控运行（包括退出、急停、轴未就绪）时清除平面历史意图。
+IF NOT bRunForce THEN
+    bXIntent := FALSE;
+    bZIntent := FALSE;
+    bXDriveActive := FALSE;
+    bZDriveActive := FALSE;
+    Fx_work_target := 0.0;
+    Fz_work_target := 0.0;
+    Fx_work := 0.0;
+    Fz_work := 0.0;
+END_IF;
+
+
+// =============================================================
+// O. 编码器值 -> 机构学位置
+// AC：-59 编码器对应 90°，编码器增大角度减小
+// =============================================================
+LBD_mm := BD_ActEnc + BD_KinOffset_mm;
+LBD_m  := LBD_mm / 1000.0;
+
+ThetaAC_deg := AC_ThetaRef_deg - (AC_ActEnc - AC_EncRef_deg);
+ThetaAC_rad := ThetaAC_deg * DEG2RAD;
+
+
+// =============================================================
+// P. 当前 E 点正解
+// =============================================================
+bGeoOK := FALSE;
+
+Cx := Ax0 + l_AC * COS(ThetaAC_rad);
+Cz := Az0 + l_AC * SIN(ThetaAC_rad);
+
+dxBC := Cx - Bx0;
+dzBC := Cz - Bz0;
+dBC := SQRT(dxBC * dxBC + dzBC * dzBC);
+
+IF (LBD_m > 0.01) AND (dBC > 0.01) THEN
+    IF (dBC < (LBD_m + l_CD - GeoMargin_m)) AND
+       (dBC > (ABS(LBD_m - l_CD) + GeoMargin_m)) THEN
+
+        alphaBC := F_Atan2_LREAL(y := dzBC, x := dxBC);
+        cosBeta := (LBD_m * LBD_m + dBC * dBC - l_CD * l_CD) / (2.0 * LBD_m * dBC);
+
+        IF (cosBeta <= 1.0) AND (cosBeta >= -1.0) THEN
+            beta := ACOS(cosBeta);
+            thBD := alphaBC - beta;
+
+            Dx := Bx0 + LBD_m * COS(thBD);
+            Dz := Bz0 + LBD_m * SIN(thBD);
+
+            theta3 := F_Atan2_LREAL(y := Dz - Cz, x := Dx - Cx);
+
+            // D 点不在 CE 上：D 相对 CE 垂直偏置 D_Offset_m
+            // theta3 是 CD 方向，thetaCE 才是 CE 主杆方向
+            IF l_CD > D_Offset_m THEN
+                s_CD_CE := SQRT(l_CD * l_CD - D_Offset_m * D_Offset_m);
+                gamma_DCE := ATAN(D_Offset_m / s_CD_CE);
+                thetaCE := theta3 + CE_Sign * gamma_DCE;
+
+                Ex := Cx + l_CE * COS(thetaCE);
+                Ez := Cz + l_CE * SIN(thetaCE);
+
+                bGeoOK := TRUE;
+            END_IF;
+        END_IF;
+    END_IF;
+END_IF;
+
+
+// =============================================================
+// Q. AC 机构角扰动 E 点正解
+// =============================================================
+bGeoOK_th := FALSE;
+
+Cx_th := Ax0 + l_AC * COS(ThetaAC_rad + dTheta);
+Cz_th := Az0 + l_AC * SIN(ThetaAC_rad + dTheta);
+
+dxBC_th := Cx_th - Bx0;
+dzBC_th := Cz_th - Bz0;
+dBC_th := SQRT(dxBC_th * dxBC_th + dzBC_th * dzBC_th);
+
+IF (LBD_m > 0.01) AND (dBC_th > 0.01) THEN
+    IF (dBC_th < (LBD_m + l_CD - GeoMargin_m)) AND
+       (dBC_th > (ABS(LBD_m - l_CD) + GeoMargin_m)) THEN
+
+        alphaBC_th := F_Atan2_LREAL(y := dzBC_th, x := dxBC_th);
+        cosBeta_th := (LBD_m * LBD_m + dBC_th * dBC_th - l_CD * l_CD) / (2.0 * LBD_m * dBC_th);
+
+        IF (cosBeta_th <= 1.0) AND (cosBeta_th >= -1.0) THEN
+            beta_th := ACOS(cosBeta_th);
+            thBD_th := alphaBC_th - beta_th;
+
+            Dx_th := Bx0 + LBD_m * COS(thBD_th);
+            Dz_th := Bz0 + LBD_m * SIN(thBD_th);
+
+            theta3_th := F_Atan2_LREAL(y := Dz_th - Cz_th, x := Dx_th - Cx_th);
+
+            IF l_CD > D_Offset_m THEN
+                s_CD_CE_th := SQRT(l_CD * l_CD - D_Offset_m * D_Offset_m);
+                gamma_DCE_th := ATAN(D_Offset_m / s_CD_CE_th);
+                thetaCE_th := theta3_th + CE_Sign * gamma_DCE_th;
+
+                Ex_th := Cx_th + l_CE * COS(thetaCE_th);
+                Ez_th := Cz_th + l_CE * SIN(thetaCE_th);
+
+                bGeoOK_th := TRUE;
+            END_IF;
+        END_IF;
+    END_IF;
+END_IF;
+
+
+// =============================================================
+// R. BD 机构长度扰动 E 点正解
+// =============================================================
+bGeoOK_L := FALSE;
+
+Cx_L := Cx;
+Cz_L := Cz;
+
+dxBC_L := Cx_L - Bx0;
+dzBC_L := Cz_L - Bz0;
+dBC_L := SQRT(dxBC_L * dxBC_L + dzBC_L * dzBC_L);
+
+IF ((LBD_m + dL) > 0.01) AND (dBC_L > 0.01) THEN
+    IF (dBC_L < ((LBD_m + dL) + l_CD - GeoMargin_m)) AND
+       (dBC_L > (ABS((LBD_m + dL) - l_CD) + GeoMargin_m)) THEN
+
+        alphaBC_L := F_Atan2_LREAL(y := dzBC_L, x := dxBC_L);
+        cosBeta_L := ((LBD_m + dL) * (LBD_m + dL) + dBC_L * dBC_L - l_CD * l_CD)
+                     / (2.0 * (LBD_m + dL) * dBC_L);
+
+        IF (cosBeta_L <= 1.0) AND (cosBeta_L >= -1.0) THEN
+            beta_L := ACOS(cosBeta_L);
+            thBD_L := alphaBC_L - beta_L;
+
+            Dx_L := Bx0 + (LBD_m + dL) * COS(thBD_L);
+            Dz_L := Bz0 + (LBD_m + dL) * SIN(thBD_L);
+
+            theta3_L := F_Atan2_LREAL(y := Dz_L - Cz_L, x := Dx_L - Cx_L);
+
+            IF l_CD > D_Offset_m THEN
+                s_CD_CE_L := SQRT(l_CD * l_CD - D_Offset_m * D_Offset_m);
+                gamma_DCE_L := ATAN(D_Offset_m / s_CD_CE_L);
+                thetaCE_L := theta3_L + CE_Sign * gamma_DCE_L;
+
+                Ex_L := Cx_L + l_CE * COS(thetaCE_L);
+                Ez_L := Cz_L + l_CE * SIN(thetaCE_L);
+
+                bGeoOK_L := TRUE;
+            END_IF;
+        END_IF;
+    END_IF;
+END_IF;
+
+
+// =============================================================
+// S. E 点速度雅可比
+// =============================================================
+bValidJ := FALSE;
+bSingular := FALSE;
+
+IF bGeoOK AND bGeoOK_th AND bGeoOK_L THEN
+    J11 := (Ex_th - Ex) / dTheta;
+    J21 := (Ez_th - Ez) / dTheta;
+
+    J12 := (Ex_L - Ex) / dL;
+    J22 := (Ez_L - Ez) / dL;
+
+    detJ := J11 * J22 - J12 * J21;
+
+    IF ABS(detJ) > DetMin THEN
+        bValidJ := TRUE;
+    ELSE
+        bSingular := TRUE;
+    END_IF;
+END_IF;
+
+
+// =============================================================
+// T. AC/BD 二维导纳 + 雅可比逆解
+// 1) 平面 X/Z 导纳由显式欧拉改为一阶精确离散：M * dV/dt + B * V = F
+//    Vss = Fadm / B
+//    V(k+1) = Vss + (V(k)-Vss) * EXP(-B*Ts/M)
+// 2) 撤力时使用 AdmB_Stop_X/Z 平滑衰减，轴减速度限幅约束最终命令。
+// 3) VxyMax_mps = 0.300，先限制末端合速度，再做 J^-1。
+// =============================================================
+BD_Vraw_enc_s := 0.0;
+AC_Vraw_enc_s := 0.0;
+AF_Vraw_enc_s := 0.0;
+Yaw_Vraw_enc_s := 0.0;
+
+IF bRunForce AND bValidJ THEN
+    Vx_last_mps := Vx_mps;
+    Vz_last_mps := Vz_mps;
+
+    // X 通道：有力用运动阻尼，撤力用停车阻尼。
+    IF NOT bXDriveActive THEN
+        AdmB_Use_X := AdmB_Stop_X;
+        Fadm_X := 0.0;
+    ELSE
+        AdmB_Use_X := AdmB_Move_X;
+        Fadm_X := ForceGain_X * TransWeight_X * Fx_work;
+    END_IF;
+
+    // Z 通道：有力用运动阻尼，撤力用停车阻尼。
+    IF NOT bZDriveActive THEN
+        AdmB_Use_Z := AdmB_Stop_Z;
+        Fadm_Z := 0.0;
+    ELSE
+        AdmB_Use_Z := AdmB_Move_Z;
+        Fadm_Z := ForceGain_Z * TransWeight_Z * Fz_work;
+    END_IF;
+
+    // M/B 安全保护，防止除零或负值。
+    IF AdmM_X < 0.001 THEN
+        AdmM_X_Use := 0.001;
+    ELSE
+        AdmM_X_Use := AdmM_X;
+    END_IF;
+
+    IF AdmM_Z < 0.001 THEN
+        AdmM_Z_Use := 0.001;
+    ELSE
+        AdmM_Z_Use := AdmM_Z;
+    END_IF;
+
+    IF AdmB_Use_X < 0.001 THEN
+        AdmB_X_UseSafe := 0.001;
+    ELSE
+        AdmB_X_UseSafe := AdmB_Use_X;
+    END_IF;
+
+    IF AdmB_Use_Z < 0.001 THEN
+        AdmB_Z_UseSafe := 0.001;
+    ELSE
+        AdmB_Z_UseSafe := AdmB_Use_Z;
+    END_IF;
+
+    // 稳态速度。撤力时 Fadm=0，因此 Vss=0。
+    Vxss_mps := Fadm_X / AdmB_X_UseSafe;
+    Vzss_mps := Fadm_Z / AdmB_Z_UseSafe;
+
+    // 精确离散指数项。
+    IF Ts > 0.000001 THEN
+        Vx_ExpK := EXP(-AdmB_X_UseSafe * Ts / AdmM_X_Use);
+        Vz_ExpK := EXP(-AdmB_Z_UseSafe * Ts / AdmM_Z_Use);
+    ELSE
+        Vx_ExpK := 0.0;
+        Vz_ExpK := 0.0;
+    END_IF;
+
+    Vx_mps := Vxss_mps + (Vx_last_mps - Vxss_mps) * Vx_ExpK;
+    Vz_mps := Vzss_mps + (Vz_last_mps - Vzss_mps) * Vz_ExpK;
+
+    IF Ts > 0.000001 THEN
+        Ax_mps2 := (Vx_mps - Vx_last_mps) / Ts;
+        Az_mps2 := (Vz_mps - Vz_last_mps) / Ts;
+    ELSE
+        Ax_mps2 := 0.0;
+        Az_mps2 := 0.0;
+    END_IF;
+
+    // NaN / 极大值保护，避免后续 J^-1 或限幅触发 FPU invalid。
+    IF Vx_mps <> Vx_mps THEN
+        Vx_mps := 0.0;
+        Vx_last_mps := 0.0;
+        Ax_mps2 := 0.0;
+    ELSIF ABS(Vx_mps) > Vplane_NumLimit_mps THEN
+        Vx_mps := 0.0;
+        Vx_last_mps := 0.0;
+        Ax_mps2 := 0.0;
+    END_IF;
+
+    IF Vz_mps <> Vz_mps THEN
+        Vz_mps := 0.0;
+        Vz_last_mps := 0.0;
+        Az_mps2 := 0.0;
+    ELSIF ABS(Vz_mps) > Vplane_NumLimit_mps THEN
+        Vz_mps := 0.0;
+        Vz_last_mps := 0.0;
+        Az_mps2 := 0.0;
+    END_IF;
+
+    // 限幅前理论平面速度。
+    Vnorm_PreLimit_mps := SQRT(Vx_mps * Vx_mps + Vz_mps * Vz_mps);
+
+    IF Vnorm_PreLimit_mps > VxyMax_mps THEN
+        ScaleVel_Plane := VxyMax_mps / Vnorm_PreLimit_mps;
+        Vx_mps := Vx_mps * ScaleVel_Plane;
+        Vz_mps := Vz_mps * ScaleVel_Plane;
+    ELSE
+        ScaleVel_Plane := 1.0;
+    END_IF;
+
+    // 限幅后的真实平面速度。Watch 中 Vnorm 显示这个值。
+    Vnorm_AfterLimit_mps := SQRT(Vx_mps * Vx_mps + Vz_mps * Vz_mps);
+    Vnorm := Vnorm_AfterLimit_mps;
+
+    qdotAC_rad_s := ( J22 * Vx_mps - J12 * Vz_mps) / detJ;
+    qdotBD_m_s   := (-J21 * Vx_mps + J11 * Vz_mps) / detJ;
+
+    // AC：机构角增大时，编码器减小。
+    AC_Vraw_enc_s := -qdotAC_rad_s * RAD2DEG;
+
+    // BD：1 mm = 1 mm，不做比例换算。
+    BD_Vraw_enc_s := qdotBD_m_s * 1000.0;
+
+ELSE
+    Vx_mps := 0.0;
+    Vz_mps := 0.0;
+    Vx_last_mps := 0.0;
+    Vz_last_mps := 0.0;
+
+    Ax_mps2 := 0.0;
+    Az_mps2 := 0.0;
+
+    Vnorm_PreLimit_mps := 0.0;
+    Vnorm_AfterLimit_mps := 0.0;
+    Vnorm := 0.0;
+    ScaleVel_Plane := 1.0;
+
+    qdotAC_rad_s := 0.0;
+    qdotBD_m_s := 0.0;
+END_IF;
+
+// axis3 AF 俯仰：Tz/Mz -> 俯仰角速度
+// 本版关键修改：
+// 1) 不再用显式欧拉 W += ((Madm-B*W)/J)*Ts 处理大 Stop 阻尼；
+// 2) 改用一阶系统精确离散 W_new = Wss + (W_old-Wss)*EXP(-B*Ts/J)；
+// 3) 撤力阻尼保持温和，减速由 AF_Dmax_enc_s2 最终约束。
+IF bRunForce THEN
+    AF_W_last_enc_s := AF_W_enc_s;
+
+    bAF_TorqueActive := ABS(Mz_work_Nm) > 0.0001;
+
+    IF bAF_TorqueActive THEN
+        AdmB_Use_AF := AdmB_Move_AF;
+        Madm_AF := TorqueGain_AF * Dir_Mz_AF * Mz_work_Nm;
+    ELSE
+        AdmB_Use_AF := AdmB_Stop_AF;
+        Madm_AF := 0.0;
+    END_IF;
+
+    // 数值保护：J 和 B 都不允许过小。
+    IF AdmJ_AF < 0.001 THEN
+        AdmJ_AF_Use := 0.001;
+    ELSE
+        AdmJ_AF_Use := AdmJ_AF;
+    END_IF;
+
+    IF AdmB_Use_AF < 0.001 THEN
+        AdmB_AF_UseSafe := 0.001;
+    ELSE
+        AdmB_AF_UseSafe := AdmB_Use_AF;
+    END_IF;
+
+    // 一阶导纳精确离散，撤力阻尼决定内部角速度衰减时间常数。
+    IF Ts > 0.000001 THEN
+        AF_ExpK := EXP(-AdmB_AF_UseSafe * Ts / AdmJ_AF_Use);
+    ELSE
+        AF_ExpK := 0.0;
+    END_IF;
+
+    AF_Wss_enc_s := Madm_AF / AdmB_AF_UseSafe;
+    AF_W_enc_s := AF_Wss_enc_s + (AF_W_last_enc_s - AF_Wss_enc_s) * AF_ExpK;
+
+    // 撤力后小速度直接归零，避免低速漂移。
+    IF (NOT bAF_TorqueActive) AND (ABS(AF_W_enc_s) < AF_StopZeroVel_enc_s) THEN
+        AF_W_enc_s := 0.0;
+    END_IF;
+
+    IF Ts > 0.000001 THEN
+        AF_Alpha_enc_s2 := (AF_W_enc_s - AF_W_last_enc_s) / Ts;
+    ELSE
+        AF_Alpha_enc_s2 := 0.0;
+    END_IF;
+
+    // NaN / 极大值保护，避免再次触发 FPU invalid。
+    IF AF_W_enc_s <> AF_W_enc_s THEN
+        AF_W_enc_s := 0.0;
+        AF_W_last_enc_s := 0.0;
+        AF_Alpha_enc_s2 := 0.0;
+    ELSIF ABS(AF_W_enc_s) > AF_NumLimit_enc_s THEN
+        AF_W_enc_s := 0.0;
+        AF_W_last_enc_s := 0.0;
+        AF_Alpha_enc_s2 := 0.0;
+    END_IF;
+
+    AF_Vraw_enc_s := AF_W_enc_s;
+ELSE
+    AF_W_enc_s := 0.0;
+    AF_W_last_enc_s := 0.0;
+    AF_Alpha_enc_s2 := 0.0;
+    AF_Vraw_enc_s := 0.0;
+END_IF;
+
+// axis4 底盘 yaw：稳定离散导纳
+// 当前 yaw 主输入来自 FzYaw_work_N -> Myaw_work_Nm -> Mx_work_Nm。
+// 这里继续使用 Mx_work_Nm 作为 yaw 有效输入，兼容你前面 Watch 变量。
+IF bRunForce THEN
+    Yaw_W_last_enc_s := Yaw_W_enc_s;
+
+    YawInput_Nm := Mx_work_Nm;
+
+    // 有 yaw 输入时用运动阻尼；撤力后用停车阻尼。
+    IF ABS(YawInput_Nm) <= 0.0001 THEN
+        AdmB_Use_Yaw := AdmB_Stop_Yaw;
+        Madm_Yaw := 0.0;
+    ELSE
+        AdmB_Use_Yaw := AdmB_Move_Yaw;
+        Madm_Yaw := TorqueGain_Yaw * Dir_Mx_Yaw * YawInput_Nm;
+    END_IF;
+
+    // J/B 安全保护。
+    IF AdmJ_Yaw < 0.001 THEN
+        AdmJ_Yaw_Use := 0.001;
+    ELSE
+        AdmJ_Yaw_Use := AdmJ_Yaw;
+    END_IF;
+
+    IF AdmB_Use_Yaw < 0.001 THEN
+        AdmB_Yaw_UseSafe := 0.001;
+    ELSE
+        AdmB_Yaw_UseSafe := AdmB_Use_Yaw;
+    END_IF;
+
+    // 一阶导纳精确离散：
+    // dW/dt = (Madm - B*W)/J
+    // Wss = Madm/B
+    // W(k+1) = Wss + (W(k)-Wss)*EXP(-B*Ts/J)
+    Yaw_Wss_enc_s := Madm_Yaw / AdmB_Yaw_UseSafe;
+
+    IF Ts > 0.000001 THEN
+        Yaw_ExpK := EXP(-AdmB_Yaw_UseSafe * Ts / AdmJ_Yaw_Use);
+    ELSE
+        Yaw_ExpK := 0.0;
+    END_IF;
+
+    Yaw_W_enc_s :=
+        Yaw_Wss_enc_s
+      + (Yaw_W_last_enc_s - Yaw_Wss_enc_s) * Yaw_ExpK;
+
+    IF Ts > 0.000001 THEN
+        Yaw_Alpha_enc_s2 := (Yaw_W_enc_s - Yaw_W_last_enc_s) / Ts;
+    ELSE
+        Yaw_Alpha_enc_s2 := 0.0;
+    END_IF;
+
+    // NaN / 极大值保护，避免再次触发 FPU invalid。
+    IF Yaw_W_enc_s <> Yaw_W_enc_s THEN
+        Yaw_W_enc_s := 0.0;
+        Yaw_W_last_enc_s := 0.0;
+        Yaw_Alpha_enc_s2 := 0.0;
+    ELSIF ABS(Yaw_W_enc_s) > Yaw_NumLimit_enc_s THEN
+        Yaw_W_enc_s := 0.0;
+        Yaw_W_last_enc_s := 0.0;
+        Yaw_Alpha_enc_s2 := 0.0;
+    END_IF;
+
+    Yaw_Vraw_enc_s := Yaw_W_enc_s;
+ELSE
+    Yaw_W_enc_s := 0.0;
+    Yaw_W_last_enc_s := 0.0;
+    Yaw_Alpha_enc_s2 := 0.0;
+    Yaw_Vraw_enc_s := 0.0;
+END_IF;
+
+
+
+
+// =============================================================
+// T1. 机构学限位对力控 Vraw 的拦截
+// 放在 U. 轴速度限幅之前；先判断，再进入速度/加速度/位置积分
+// =============================================================
+bLimitClampPlanar := FALSE;
+bLimitClampAF := FALSE;
+
+// BD 只受 CE-HI 限位
+IF (BD_Vraw_enc_s > 0.0) AND bCEHI_Block_BD_Pos THEN
+    BD_Vraw_enc_s := 0.0;
+    bLimitClampPlanar := TRUE;
+END_IF;
+
+IF (BD_Vraw_enc_s < 0.0) AND bCEHI_Block_BD_Neg THEN
+    BD_Vraw_enc_s := 0.0;
+    bLimitClampPlanar := TRUE;
+END_IF;
+
+// AC 同时受 CAF 和 CE-HI 限位
+IF (AC_Vraw_enc_s > 0.0) AND (bCAF_Block_AC_Pos OR bCEHI_Block_AC_Pos) THEN
+    AC_Vraw_enc_s := 0.0;
+    bLimitClampPlanar := TRUE;
+END_IF;
+
+IF (AC_Vraw_enc_s < 0.0) AND (bCAF_Block_AC_Neg OR bCEHI_Block_AC_Neg) THEN
+    AC_Vraw_enc_s := 0.0;
+    bLimitClampPlanar := TRUE;
+END_IF;
+
+// AF 同时受 CAF 和 CE-HI 限位
+IF (AF_Vraw_enc_s > 0.0) AND (bCAF_Block_AF_Pos OR bCEHI_Block_AF_Pos) THEN
+    AF_Vraw_enc_s := 0.0;
+    bLimitClampAF := TRUE;
+END_IF;
+
+IF (AF_Vraw_enc_s < 0.0) AND (bCAF_Block_AF_Neg OR bCEHI_Block_AF_Neg) THEN
+    AF_Vraw_enc_s := 0.0;
+    bLimitClampAF := TRUE;
+END_IF;
+
+// 清导纳内部速度记忆，防止继续顶限位
+IF bLimitClampPlanar THEN
+    Vx_mps := 0.0;
+    Vz_mps := 0.0;
+    Vx_last_mps := 0.0;
+    Vz_last_mps := 0.0;
+    Ax_mps2 := 0.0;
+    Az_mps2 := 0.0;
+END_IF;
+
+IF bLimitClampAF THEN
+    AF_W_enc_s := 0.0;
+    AF_W_last_enc_s := 0.0;
+    AF_Alpha_enc_s2 := 0.0;
+END_IF;
+
+
+// =============================================================
+// U. 轴速度限幅
+// =============================================================
+ScaleVel := 1.0;
+ScaleVel_Axis := 1.0;
+
+IF ABS(BD_Vraw_enc_s) > BD_Vmax_enc_s THEN
+    tmpScale := BD_Vmax_enc_s / ABS(BD_Vraw_enc_s);
+    IF tmpScale < ScaleVel THEN
+        ScaleVel := tmpScale;
+    END_IF;
+END_IF;
+
+IF ABS(AC_Vraw_enc_s) > AC_Vmax_enc_s THEN
+    tmpScale := AC_Vmax_enc_s / ABS(AC_Vraw_enc_s);
+    IF tmpScale < ScaleVel THEN
+        ScaleVel := tmpScale;
+    END_IF;
+END_IF;
+
+ScaleVel_Axis := ScaleVel;
+
+BD_Vraw_enc_s := BD_Vraw_enc_s * ScaleVel_Axis;
+AC_Vraw_enc_s := AC_Vraw_enc_s * ScaleVel_Axis;
+
+// AF/Yaw 速度限幅：不用 x/ABS(x)，避免 Infinity/Infinity 触发 FPU invalid。
+IF AF_Vraw_enc_s <> AF_Vraw_enc_s THEN
+    AF_Vraw_enc_s := 0.0;
+    AF_W_enc_s := 0.0;
+    AF_W_last_enc_s := 0.0;
+ELSIF ABS(AF_Vraw_enc_s) > AF_NumLimit_enc_s THEN
+    AF_Vraw_enc_s := 0.0;
+    AF_W_enc_s := 0.0;
+    AF_W_last_enc_s := 0.0;
+END_IF;
+
+IF AF_Vraw_enc_s > AF_Vmax_enc_s THEN
+    AF_Vraw_enc_s := AF_Vmax_enc_s;
+ELSIF AF_Vraw_enc_s < -AF_Vmax_enc_s THEN
+    AF_Vraw_enc_s := -AF_Vmax_enc_s;
+END_IF;
+
+IF Yaw_Vraw_enc_s <> Yaw_Vraw_enc_s THEN
+    Yaw_Vraw_enc_s := 0.0;
+    Yaw_W_enc_s := 0.0;
+    Yaw_W_last_enc_s := 0.0;
+ELSIF ABS(Yaw_Vraw_enc_s) > 100000.0 THEN
+    Yaw_Vraw_enc_s := 0.0;
+    Yaw_W_enc_s := 0.0;
+    Yaw_W_last_enc_s := 0.0;
+END_IF;
+
+IF Yaw_Vraw_enc_s > Yaw_Vmax_enc_s THEN
+    Yaw_Vraw_enc_s := Yaw_Vmax_enc_s;
+ELSIF Yaw_Vraw_enc_s < -Yaw_Vmax_enc_s THEN
+    Yaw_Vraw_enc_s := -Yaw_Vmax_enc_s;
+END_IF;
+
+
+// =============================================================
+// V. 加速度限幅
+// =============================================================
+BD_Vlast_enc_s := BD_Vcmd_enc_s;
+AC_Vlast_enc_s := AC_Vcmd_enc_s;
+AF_Vlast_enc_s := AF_Vcmd_enc_s;
+Yaw_Vlast_enc_s := Yaw_Vcmd_enc_s;
+
+// AC/BD 加减速度限幅：
+// 1) 加速使用 BD_Amax/AC_Amax；
+// 2) 撤力减速或反向使用 BD_Dmax/AC_Dmax；
+// 3) 最后用同一个 ScaleAcc_Axis 同步缩放 BD/AC，保持末端方向不被破坏。
+BD_dV_enc_s := BD_Vraw_enc_s - BD_Vlast_enc_s;
+AC_dV_enc_s := AC_Vraw_enc_s - AC_Vlast_enc_s;
+
+IF (ABS(BD_Vraw_enc_s) < ABS(BD_Vlast_enc_s)) OR (BD_Vraw_enc_s * BD_Vlast_enc_s < 0.0) THEN
+    BD_dVmax_enc_s := BD_Dmax_enc_s2 * Ts;
+ELSE
+    BD_dVmax_enc_s := BD_Amax_enc_s2 * Ts;
+END_IF;
+
+IF (ABS(AC_Vraw_enc_s) < ABS(AC_Vlast_enc_s)) OR (AC_Vraw_enc_s * AC_Vlast_enc_s < 0.0) THEN
+    AC_dVmax_enc_s := AC_Dmax_enc_s2 * Ts;
+ELSE
+    AC_dVmax_enc_s := AC_Amax_enc_s2 * Ts;
+END_IF;
+
+ScaleAcc := 1.0;
+ScaleAcc_Axis := 1.0;
+
+IF ABS(BD_dV_enc_s) > BD_dVmax_enc_s THEN
+    IF BD_dVmax_enc_s > 0.0 THEN
+        tmpScale := BD_dVmax_enc_s / ABS(BD_dV_enc_s);
+    ELSE
+        tmpScale := 0.0;
+    END_IF;
+    IF tmpScale < ScaleAcc THEN
+        ScaleAcc := tmpScale;
+    END_IF;
+END_IF;
+
+IF ABS(AC_dV_enc_s) > AC_dVmax_enc_s THEN
+    IF AC_dVmax_enc_s > 0.0 THEN
+        tmpScale := AC_dVmax_enc_s / ABS(AC_dV_enc_s);
+    ELSE
+        tmpScale := 0.0;
+    END_IF;
+    IF tmpScale < ScaleAcc THEN
+        ScaleAcc := tmpScale;
+    END_IF;
+END_IF;
+
+ScaleAcc_Axis := ScaleAcc;
+
+BD_Vcmd_enc_s := BD_Vlast_enc_s + BD_dV_enc_s * ScaleAcc_Axis;
+AC_Vcmd_enc_s := AC_Vlast_enc_s + AC_dV_enc_s * ScaleAcc_Axis;
+
+IF Ts > 0.000001 THEN
+    BD_Acmd_enc_s2 := (BD_Vcmd_enc_s - BD_Vlast_enc_s) / Ts;
+    AC_Acmd_enc_s2 := (AC_Vcmd_enc_s - AC_Vlast_enc_s) / Ts;
+ELSE
+    BD_Acmd_enc_s2 := 0.0;
+    AC_Acmd_enc_s2 := 0.0;
+END_IF;
+
+// AF 加减速度限幅：加速用 AF_Amax，撤力减速/反向用更大的 AF_Dmax。
+AF_dV_enc_s := AF_Vraw_enc_s - AF_Vlast_enc_s;
+
+IF (ABS(AF_Vraw_enc_s) < ABS(AF_Vlast_enc_s)) OR (AF_Vraw_enc_s * AF_Vlast_enc_s < 0.0) THEN
+    AF_dVmax_enc_s := AF_Dmax_enc_s2 * Ts;
+ELSE
+    AF_dVmax_enc_s := AF_Amax_enc_s2 * Ts;
+END_IF;
+
+IF AF_dV_enc_s > AF_dVmax_enc_s THEN
+    AF_dV_enc_s := AF_dVmax_enc_s;
+ELSIF AF_dV_enc_s < -AF_dVmax_enc_s THEN
+    AF_dV_enc_s := -AF_dVmax_enc_s;
+END_IF;
+
+AF_Vcmd_enc_s := AF_Vlast_enc_s + AF_dV_enc_s;
+
+IF Ts > 0.000001 THEN
+    AF_Acmd_enc_s2 := (AF_Vcmd_enc_s - AF_Vlast_enc_s) / Ts;
+ELSE
+    AF_Acmd_enc_s2 := 0.0;
+END_IF;
+
+// yaw 加减速度限幅：加速用 Yaw_Amax，撤力减速/反向用 Yaw_Dmax。
+Yaw_dV_enc_s := Yaw_Vraw_enc_s - Yaw_Vlast_enc_s;
+
+IF (ABS(Yaw_Vraw_enc_s) < ABS(Yaw_Vlast_enc_s)) OR (Yaw_Vraw_enc_s * Yaw_Vlast_enc_s < 0.0) THEN
+    Yaw_dVmax_enc_s := Yaw_Dmax_enc_s2 * Ts;
+ELSE
+    Yaw_dVmax_enc_s := Yaw_Amax_enc_s2 * Ts;
+END_IF;
+
+IF Yaw_dV_enc_s > Yaw_dVmax_enc_s THEN
+    Yaw_dV_enc_s := Yaw_dVmax_enc_s;
+ELSIF Yaw_dV_enc_s < -Yaw_dVmax_enc_s THEN
+    Yaw_dV_enc_s := -Yaw_dVmax_enc_s;
+END_IF;
+
+Yaw_Vcmd_enc_s := Yaw_Vlast_enc_s + Yaw_dV_enc_s;
+
+IF Ts > 0.000001 THEN
+    Yaw_Acmd_enc_s2 := (Yaw_Vcmd_enc_s - Yaw_Vlast_enc_s) / Ts;
+ELSE
+    Yaw_Acmd_enc_s2 := 0.0;
+END_IF;
+
+
+
+
+// =============================================================
+// V1. 机构学限位对力控 Vcmd 的最终保险
+// 放在 W. 小速度归零之前，位置积分之前
+// =============================================================
+// BD
+IF (BD_Vcmd_enc_s > 0.0) AND bCEHI_Block_BD_Pos THEN
+    BD_Vcmd_enc_s := 0.0;
+    BD_Acmd_enc_s2 := 0.0;
+END_IF;
+
+IF (BD_Vcmd_enc_s < 0.0) AND bCEHI_Block_BD_Neg THEN
+    BD_Vcmd_enc_s := 0.0;
+    BD_Acmd_enc_s2 := 0.0;
+END_IF;
+
+// AC
+IF (AC_Vcmd_enc_s > 0.0) AND (bCAF_Block_AC_Pos OR bCEHI_Block_AC_Pos) THEN
+    AC_Vcmd_enc_s := 0.0;
+    AC_Acmd_enc_s2 := 0.0;
+END_IF;
+
+IF (AC_Vcmd_enc_s < 0.0) AND (bCAF_Block_AC_Neg OR bCEHI_Block_AC_Neg) THEN
+    AC_Vcmd_enc_s := 0.0;
+    AC_Acmd_enc_s2 := 0.0;
+END_IF;
+
+// AF
+IF (AF_Vcmd_enc_s > 0.0) AND (bCAF_Block_AF_Pos OR bCEHI_Block_AF_Pos) THEN
+    AF_Vcmd_enc_s := 0.0;
+    AF_Acmd_enc_s2 := 0.0;
+    AF_W_enc_s := 0.0;
+    AF_W_last_enc_s := 0.0;
+END_IF;
+
+IF (AF_Vcmd_enc_s < 0.0) AND (bCAF_Block_AF_Neg OR bCEHI_Block_AF_Neg) THEN
+    AF_Vcmd_enc_s := 0.0;
+    AF_Acmd_enc_s2 := 0.0;
+    AF_W_enc_s := 0.0;
+    AF_W_last_enc_s := 0.0;
+END_IF;
+
+
+// =============================================================
+// W. 小速度归零
+// =============================================================
+IF ABS(BD_Vcmd_enc_s) < 0.001 THEN
+    BD_Vcmd_enc_s := 0.0;
+END_IF;
+
+IF ABS(AC_Vcmd_enc_s) < 0.001 THEN
+    AC_Vcmd_enc_s := 0.0;
+END_IF;
+
+IF ABS(AF_Vcmd_enc_s) < 0.02 THEN
+    AF_Vcmd_enc_s := 0.0;
+END_IF;
+
+IF ABS(Yaw_Vcmd_enc_s) < 0.001 THEN
+    Yaw_Vcmd_enc_s := 0.0;
+END_IF;
+
+// =============================================================
+// W1. 轴1抱闸未释放时冻结 BD 给定
+// 防止抱闸合上或释放延时未到时，BD 外部位置继续积分。
+// =============================================================
+IF NOT Axis1_BrakeMotionOK THEN
+    BD_Vraw_enc_s := 0.0;
+    BD_Vcmd_enc_s := 0.0;
+    BD_Vlast_enc_s := 0.0;
+    BD_Acmd_enc_s2 := 0.0;
+    qdotBD_m_s := 0.0;
+    BD_PosCmd_Enc := BD_ActEnc;
+END_IF;
+
+
+// =============================================================
+// X. 力控基础软限位
+// 当前只对 axis1=BD 编码器 2~600 做限位
+// =============================================================
+bForceSoftLimit := FALSE;
+
+BD_NextCmd_Enc := BD_PosCmd_Enc + BD_Vcmd_enc_s * Ts;
+AC_NextCmd_Enc := AC_PosCmd_Enc + AC_Vcmd_enc_s * Ts;
+AF_NextCmd_Enc := AF_PosCmd_Enc + AF_Vcmd_enc_s * Ts;
+Yaw_NextCmd_Enc := Yaw_PosCmd_Enc + Yaw_Vcmd_enc_s * Ts;
+
+IF (BD_NextCmd_Enc < BD_EncMin) OR (BD_NextCmd_Enc > BD_EncMax) THEN
+    bForceSoftLimit := TRUE;
+END_IF;
+
+IF bUseAFLimit THEN
+    IF (AF_NextCmd_Enc < AF_EncMin) OR (AF_NextCmd_Enc > AF_EncMax) THEN
+        bForceSoftLimit := TRUE;
+    END_IF;
+END_IF;
+
+IF (Yaw_NextCmd_Enc < Base_EncMin) OR (Yaw_NextCmd_Enc > Base_EncMax) THEN
+    bForceSoftLimit := TRUE;
+END_IF;
+
+IF bForceSoftLimit THEN
+    BD_Vcmd_enc_s := 0.0;
+    AC_Vcmd_enc_s := 0.0;
+    AF_Vcmd_enc_s := 0.0;
+    Yaw_Vcmd_enc_s := 0.0;
+
+    BD_Acmd_enc_s2 := 0.0;
+    AC_Acmd_enc_s2 := 0.0;
+    AF_Acmd_enc_s2 := 0.0;
+    Yaw_Acmd_enc_s2 := 0.0;
+
+    Vx_mps := 0.0;
+    Vz_mps := 0.0;
+    AF_W_enc_s := 0.0;
+    Yaw_W_enc_s := 0.0;
+END_IF;
+
+
+// =============================================================
+// Y. 位置积分
+// 外部位置给定使用真实 NC 编码器坐标
+// =============================================================
+IF bRunForce AND NOT bForceSoftLimit THEN
+    BD_PosCmd_Enc := BD_PosCmd_Enc + BD_Vcmd_enc_s * Ts;
+    AC_PosCmd_Enc := AC_PosCmd_Enc + AC_Vcmd_enc_s * Ts;
+    AF_PosCmd_Enc := AF_PosCmd_Enc + AF_Vcmd_enc_s * Ts;
+    Yaw_PosCmd_Enc := Yaw_PosCmd_Enc + Yaw_Vcmd_enc_s * Ts;
+END_IF;
+
+
+// =============================================================
+// Z. Direction 判断
+// =============================================================
+IF BD_Vcmd_enc_s > 0.001 THEN
+    DirBD := 1;
+ELSIF BD_Vcmd_enc_s < -0.001 THEN
+    DirBD := -1;
+ELSE
+    DirBD := 0;
+END_IF;
+
+IF AC_Vcmd_enc_s > 0.001 THEN
+    DirAC := 1;
+ELSIF AC_Vcmd_enc_s < -0.001 THEN
+    DirAC := -1;
+ELSE
+    DirAC := 0;
+END_IF;
+
+IF AF_Vcmd_enc_s > 0.001 THEN
+    DirAF := 1;
+ELSIF AF_Vcmd_enc_s < -0.001 THEN
+    DirAF := -1;
+ELSE
+    DirAF := 0;
+END_IF;
+
+IF Yaw_Vcmd_enc_s > 0.001 THEN
+    DirYaw := 1;
+ELSIF Yaw_Vcmd_enc_s < -0.001 THEN
+    DirYaw := -1;
+ELSE
+    DirYaw := 0;
+END_IF;
+
+
+// =============================================================
+// Z1. 每周期 Feed axis1 / axis2 / axis3 / axis4
+// 急停、未 Ready、未力控时，不再 Feed，避免恢复后继续追旧目标。
+// =============================================================
+IF bRunForce AND bAxesReadyForForce THEN
+    bFeedBD := MC_ExtSetPointGenFeed(
+        Axis := axis1,
+        Position := BD_PosCmd_Enc,
+        Velocity := ABS(BD_Vcmd_enc_s),
+        Acceleration := ABS(BD_Acmd_enc_s2),
+        Direction := DirBD
+    );
+
+    bFeedAC := MC_ExtSetPointGenFeed(
+        Axis := axis2,
+        Position := AC_PosCmd_Enc,
+        Velocity := ABS(AC_Vcmd_enc_s),
+        Acceleration := ABS(AC_Acmd_enc_s2),
+        Direction := DirAC
+    );
+
+    bFeedAF := MC_ExtSetPointGenFeed(
+        Axis := axis3,
+        Position := AF_PosCmd_Enc,
+        Velocity := ABS(AF_Vcmd_enc_s),
+        Acceleration := ABS(AF_Acmd_enc_s2),
+        Direction := DirAF
+    );
+
+    bFeedYaw := MC_ExtSetPointGenFeed(
+        Axis := axis4,
+        Position := Yaw_PosCmd_Enc,
+        Velocity := ABS(Yaw_Vcmd_enc_s),
+        Acceleration := ABS(Yaw_Acmd_enc_s2),
+        Direction := DirYaw
+    );
+ELSE
+    bFeedBD := FALSE;
+    bFeedAC := FALSE;
+    bFeedAF := FALSE;
+    bFeedYaw := FALSE;
+
+    // 非力控/急停/轴未 Ready 时保持目标等于当前位置，防止恢复后跳变。
+    IF NOT bRunForce THEN
+        BD_PosCmd_Enc := BD_ActEnc;
+        AC_PosCmd_Enc := AC_ActEnc;
+        AF_PosCmd_Enc := AF_ActEnc;
+        Yaw_PosCmd_Enc := Yaw_ActEnc;
+    END_IF;
+END_IF;
+
+
+// =============================================================
+// Z2. 抱闸和灯
+// =============================================================
+// 轴1抱闸 axis1baozha 已在 D1 中按“轴1真实使能 + 无故障 + 300ms 延时”逻辑处理。
+// 这里保留 axis4 原逻辑。注意：axis4 不受 CE-HI 限位影响。
+axis4baozha := ballow_axis4jogfw OR ballow_axis4jogbw OR bRunForce;
+
+// 电磁阀和电磁阀灯完全独立，不经过 CAF/CEHI 限位。
+valveopen1 := valvejudge;
+valveopen2 := valvejudge;
+valvelight := valvejudge;
+
+// 指示灯也从 CEHI/CAF 限位逻辑中拆出来：
+// 手动模式下，只要按钮输入为 TRUE 就亮，用于确认按钮链路；
+// 力控模式下，对应轴有速度给定时也亮。
+// 这样即使某方向被软限位禁止，按键灯仍能亮，便于判断“输入有效但被限位拦截”。
+bOutput_axis1light :=
+    bInput_axis1jogfw OR bInput_axis1jogbw
+    OR (bRunForce AND (ABS(BD_Vcmd_enc_s) > 0.001));
+
+bOutput_axis2light :=
+    bInput_axis2jogfw OR bInput_axis2jogbw
+    OR (bRunForce AND (ABS(AC_Vcmd_enc_s) > 0.001));
+
+bOutput_axis3light :=
+    bInput_axis3jogfw OR bInput_axis3jogbw
+    OR (bRunForce AND (ABS(AF_Vcmd_enc_s) > 0.02));
+
+bOutput_axis4light :=
+    bInput_axis4jogfw OR bInput_axis4jogbw
+    OR (bRunForce AND (ABS(Yaw_Vcmd_enc_s) > 0.001));
+
+    likonglight := bForceMode;
+
+// =============================================================
+// Z3. 错误输出
+// =============================================================
+axis1_status(Axis := axis1, Enable := TRUE);
+axis2_status(Axis := axis2, Enable := TRUE);
+axis3_status(Axis := axis3, Enable := TRUE);
+axis4_status(Axis := axis4, Enable := TRUE);
+
+bAxis1Err := axis1_power.Error OR axis1_status.Error OR axis1_status.ErrorStop;
+bAxis2Err := axis2_power.Error OR axis2_status.Error OR axis2_status.ErrorStop;
+bAxis3Err := axis3_power.Error OR axis3_status.Error OR axis3_status.ErrorStop;
+bAxis4Err := axis4_power.Error OR axis4_status.Error OR axis4_status.ErrorStop;
+
+bAnyAxisErr := bAxis1Err OR bAxis2Err OR bAxis3Err OR bAxis4Err;
+
+IF bResetStopReason THEN
+    StopReasonCode := 0;
+    bStopReasonLatched := FALSE;
+END_IF;
+
+IF bRunForce AND NOT bStopReasonLatched THEN
+
+    IF NOT bForceMode THEN
+        StopReasonCode := 1;
+        bStopReasonLatched := TRUE;
+
+    ELSIF NOT bAxesReadyForForce THEN
+        StopReasonCode := 2;
+        bStopReasonLatched := TRUE;
+
+   ELSIF bAnyAxisErr THEN
+    StopReasonCode := 3;
+    bStopReasonLatched := TRUE;
+    
+
+    ELSIF bCEHI_Block_BD_Pos OR bCEHI_Block_BD_Neg
+       OR bCEHI_Block_AC_Pos OR bCEHI_Block_AC_Neg
+       OR bCEHI_Block_AF_Pos OR bCEHI_Block_AF_Neg THEN
+        StopReasonCode := 4;
+        bStopReasonLatched := TRUE;
+
+    ELSIF bCAF_Block_AC_Pos OR bCAF_Block_AC_Neg
+       OR bCAF_Block_AF_Pos OR bCAF_Block_AF_Neg THEN
+        StopReasonCode := 5;
+        bStopReasonLatched := TRUE;
+
+    ELSIF NOT bExtBD OR NOT bExtAC THEN
+        StopReasonCode := 6;
+        bStopReasonLatched := TRUE;
+
+    ELSIF NOT Axis1_BrakeMotionOK THEN
+        StopReasonCode := 7;
+        bStopReasonLatched := TRUE;
+    END_IF;
+
+END_IF;
+
+bError := axis1_power.Error OR axis2_power.Error OR axis3_power.Error OR axis4_power.Error
+       OR axis1_jogerror OR axis2_jogerror OR axis3_jogerror OR axis4_jogerror
+       OR fbExtEnableBD.Error OR fbExtEnableAC.Error OR fbExtEnableAF.Error OR fbExtEnableYaw.Error
+       OR fbExtDisableBD.Error OR fbExtDisableAC.Error OR fbExtDisableAF.Error OR fbExtDisableYaw.Error
+       OR axis1_reset.Error OR axis2_reset.Error OR axis3_reset.Error OR axis4_reset.Error;
+
+IF axis1_power.Error THEN
+    nErrorID := axis1_power.ErrorID;
+ELSIF axis2_power.Error THEN
+    nErrorID := axis2_power.ErrorID;
+ELSIF axis3_power.Error THEN
+    nErrorID := axis3_power.ErrorID;
+ELSIF axis4_power.Error THEN
+    nErrorID := axis4_power.ErrorID;
+ELSIF axis1_jogerror THEN
+    nErrorID := axis1_jogerrorid;
+ELSIF axis2_jogerror THEN
+    nErrorID := axis2_jogerrorid;
+ELSIF axis3_jogerror THEN
+    nErrorID := axis3_jogerrorid;
+ELSIF axis4_jogerror THEN
+    nErrorID := axis4_jogerrorid;
+ELSIF fbExtEnableBD.Error THEN
+    nErrorID := fbExtEnableBD.ErrorID;
+ELSIF fbExtEnableAC.Error THEN
+    nErrorID := fbExtEnableAC.ErrorID;
+ELSIF fbExtEnableAF.Error THEN
+    nErrorID := fbExtEnableAF.ErrorID;
+ELSIF fbExtEnableYaw.Error THEN
+    nErrorID := fbExtEnableYaw.ErrorID;
+ELSIF fbExtDisableBD.Error THEN
+    nErrorID := fbExtDisableBD.ErrorID;
+ELSIF fbExtDisableAC.Error THEN
+    nErrorID := fbExtDisableAC.ErrorID;
+ELSIF fbExtDisableAF.Error THEN
+    nErrorID := fbExtDisableAF.ErrorID;
+ELSIF fbExtDisableYaw.Error THEN
+    nErrorID := fbExtDisableYaw.ErrorID;
+ELSIF axis1_reset.Error THEN
+    nErrorID := axis1_reset.ErrorID;
+ELSIF axis2_reset.Error THEN
+    nErrorID := axis2_reset.ErrorID;
+ELSIF axis3_reset.Error THEN
+    nErrorID := axis3_reset.ErrorID;
+ELSIF axis4_reset.Error THEN
+    nErrorID := axis4_reset.ErrorID;
+ELSE
+    nErrorID := 0;
+END_IF;]]></ST>
+    </Implementation>
+    <LineIds Name="MAIN">
+      <LineId Id="162129" Count="2823" />
+      <LineId Id="127014" Count="0" />
+      <LineId Id="2828" Count="22" />
+      <LineId Id="2" Count="0" />
+    </LineIds>
+  </POU>
+</TcPlcObject>

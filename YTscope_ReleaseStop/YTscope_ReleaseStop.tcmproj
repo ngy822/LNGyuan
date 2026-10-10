@@ -1,0 +1,14 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <ProjectGuid>{1d0458bf-60ab-42c6-8b5b-12d247c905a5}</ProjectGuid>
+    <AssemblyName>YTscope_ReleaseStop</AssemblyName>
+    <Name>YTscope_ReleaseStop</Name>
+    <RootNamespace>YTscope_ReleaseStop</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <Content Include="YT Scope Project.tcscopex">
+      <SubType>Content</SubType>
+    </Content>
+  </ItemGroup>
+</Project>

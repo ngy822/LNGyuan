@@ -1,0 +1,98 @@
+﻿order,category,name,symbol,plc_type,scope_type,size,unit
+1,01_Core,Fx_filt,MAIN.Fx_filt,LREAL,REAL64,8,N
+2,01_Core,Fz_filt,MAIN.Fz_filt,LREAL,REAL64,8,N
+3,01_Core,bXIntent,MAIN.bXIntent,BOOL,BIT,1,bool
+4,01_Core,bZIntent,MAIN.bZIntent,BOOL,BIT,1,bool
+5,01_Core,Fx_work,MAIN.Fx_work,LREAL,REAL64,8,N
+6,01_Core,Fz_work,MAIN.Fz_work,LREAL,REAL64,8,N
+7,01_Core,BD_Vcmd_enc_s,MAIN.BD_Vcmd_enc_s,LREAL,REAL64,8,mm/s
+8,01_Core,AC_Vcmd_enc_s,MAIN.AC_Vcmd_enc_s,LREAL,REAL64,8,deg/s
+9,02_RawBias,Fx_raw_N,MAIN.Fx_raw_N,LREAL,REAL64,8,N
+10,02_RawBias,Fy_raw_N,MAIN.Fy_raw_N,LREAL,REAL64,8,N
+11,02_RawBias,Fz_raw_N,MAIN.Fz_raw_N,LREAL,REAL64,8,N
+12,02_RawBias,Mx_raw_Nm,MAIN.Mx_raw_Nm,LREAL,REAL64,8,N m
+13,02_RawBias,My_raw_Nm,MAIN.My_raw_Nm,LREAL,REAL64,8,N m
+14,02_RawBias,Mz_raw_Nm,MAIN.Mz_raw_Nm,LREAL,REAL64,8,N m
+15,02_RawBias,Fx_bias_N,MAIN.Fx_bias_N,LREAL,REAL64,8,N
+16,02_RawBias,Fy_bias_N,MAIN.Fy_bias_N,LREAL,REAL64,8,N
+17,02_RawBias,Fz_bias_N,MAIN.Fz_bias_N,LREAL,REAL64,8,N
+18,02_RawBias,bFx_N,MAIN.bFx_N,LREAL,REAL64,8,N
+19,02_RawBias,bFy_N,MAIN.bFy_N,LREAL,REAL64,8,N
+20,02_RawBias,bFz_N,MAIN.bFz_N,LREAL,REAL64,8,N
+21,02_RawBias,Fhuman_S_X,MAIN.Fhuman_S_X,LREAL,REAL64,8,N
+22,02_RawBias,Fhuman_S_Y,MAIN.Fhuman_S_Y,LREAL,REAL64,8,N
+23,02_RawBias,Fhuman_S_Z,MAIN.Fhuman_S_Z,LREAL,REAL64,8,N
+24,02_RawBias,Fx_ext_N,MAIN.Fx_ext_N,LREAL,REAL64,8,N
+25,02_RawBias,Fz_ext_N,MAIN.Fz_ext_N,LREAL,REAL64,8,N
+26,03_PlaneAdmittance,bXDriveActive,MAIN.bXDriveActive,BOOL,BIT,1,bool
+27,03_PlaneAdmittance,bZDriveActive,MAIN.bZDriveActive,BOOL,BIT,1,bool
+28,03_PlaneAdmittance,Fx_work_target,MAIN.Fx_work_target,LREAL,REAL64,8,N
+29,03_PlaneAdmittance,Fz_work_target,MAIN.Fz_work_target,LREAL,REAL64,8,N
+30,03_PlaneAdmittance,Fadm_X,MAIN.Fadm_X,LREAL,REAL64,8,N
+31,03_PlaneAdmittance,Fadm_Z,MAIN.Fadm_Z,LREAL,REAL64,8,N
+32,03_PlaneAdmittance,AdmB_Use_X,MAIN.AdmB_Use_X,LREAL,REAL64,8,virtual damping
+33,03_PlaneAdmittance,AdmB_Use_Z,MAIN.AdmB_Use_Z,LREAL,REAL64,8,virtual damping
+34,03_PlaneAdmittance,Vx_mps,MAIN.Vx_mps,LREAL,REAL64,8,m/s
+35,03_PlaneAdmittance,Vz_mps,MAIN.Vz_mps,LREAL,REAL64,8,m/s
+36,03_PlaneAdmittance,BD_Vraw_enc_s,MAIN.BD_Vraw_enc_s,LREAL,REAL64,8,mm/s
+37,03_PlaneAdmittance,AC_Vraw_enc_s,MAIN.AC_Vraw_enc_s,LREAL,REAL64,8,deg/s
+38,03_PlaneAdmittance,ScaleVel_Axis,MAIN.ScaleVel_Axis,LREAL,REAL64,8,ratio
+39,03_PlaneAdmittance,ScaleAcc_Axis,MAIN.ScaleAcc_Axis,LREAL,REAL64,8,ratio
+40,04_BDTracking,BD_PosCmd_Enc,MAIN.BD_PosCmd_Enc,LREAL,REAL64,8,mm
+41,04_BDTracking,BD_ActEnc,MAIN.BD_ActEnc,LREAL,REAL64,8,mm
+42,04_BDTracking,axis1.NcToPlc.SetPos,MAIN.axis1.NcToPlc.SetPos,LREAL,REAL64,8,mm
+43,04_BDTracking,axis1.NcToPlc.ActVelo,MAIN.axis1.NcToPlc.ActVelo,LREAL,REAL64,8,mm/s
+44,04_BDTracking,axis1.NcToPlc.SetVelo,MAIN.axis1.NcToPlc.SetVelo,LREAL,REAL64,8,mm/s
+45,04_BDTracking,axis1.NcToPlc.PosDiff,MAIN.axis1.NcToPlc.PosDiff,LREAL,REAL64,8,mm
+46,04_BDTracking,BD_Acmd_enc_s2,MAIN.BD_Acmd_enc_s2,LREAL,REAL64,8,mm/s2
+47,04_BDTracking,axis1.NcToPlc.ErrorCode,MAIN.axis1.NcToPlc.ErrorCode,UDINT,UINT32,4,code
+48,04_BDTracking,axis1.NcToPlc.DcTimeStamp,MAIN.axis1.NcToPlc.DcTimeStamp,UDINT,UINT32,4,NC timestamp (raw)
+49,05_ACTracking,AC_PosCmd_Enc,MAIN.AC_PosCmd_Enc,LREAL,REAL64,8,deg
+50,05_ACTracking,AC_ActEnc,MAIN.AC_ActEnc,LREAL,REAL64,8,deg
+51,05_ACTracking,axis2.NcToPlc.SetPos,MAIN.axis2.NcToPlc.SetPos,LREAL,REAL64,8,deg
+52,05_ACTracking,axis2.NcToPlc.ActVelo,MAIN.axis2.NcToPlc.ActVelo,LREAL,REAL64,8,deg/s
+53,05_ACTracking,axis2.NcToPlc.SetVelo,MAIN.axis2.NcToPlc.SetVelo,LREAL,REAL64,8,deg/s
+54,05_ACTracking,axis2.NcToPlc.PosDiff,MAIN.axis2.NcToPlc.PosDiff,LREAL,REAL64,8,deg
+55,05_ACTracking,AC_Acmd_enc_s2,MAIN.AC_Acmd_enc_s2,LREAL,REAL64,8,deg/s2
+56,05_ACTracking,axis2.NcToPlc.ErrorCode,MAIN.axis2.NcToPlc.ErrorCode,UDINT,UINT32,4,code
+57,05_ACTracking,axis2.NcToPlc.DcTimeStamp,MAIN.axis2.NcToPlc.DcTimeStamp,UDINT,UINT32,4,NC timestamp (raw)
+58,06_PoseZcomp,AF_ActEnc,MAIN.AF_ActEnc,LREAL,REAL64,8,deg
+59,06_PoseZcomp,Yaw_ActEnc,MAIN.Yaw_ActEnc,LREAL,REAL64,8,deg
+60,06_PoseZcomp,AF_ForceRel_deg,MAIN.AF_ForceRel_deg,LREAL,REAL64,8,deg
+61,06_PoseZcomp,AF_BlendPoll,MAIN.AF_BlendPoll,LREAL,REAL64,8,deg
+62,06_PoseZcomp,FzYaw_raw_N,MAIN.FzYaw_raw_N,LREAL,REAL64,8,N
+63,06_PoseZcomp,FzYaw_rawFilt_N,MAIN.FzYaw_rawFilt_N,LREAL,REAL64,8,N
+64,06_PoseZcomp,FzYawPollRaw_N,MAIN.FzYawPollRaw_N,LREAL,REAL64,8,N
+65,06_PoseZcomp,FzYawPollUsed_N,MAIN.FzYawPollUsed_N,LREAL,REAL64,8,N
+66,06_PoseZcomp,FzYawCandidate_N,MAIN.FzYawCandidate_N,LREAL,REAL64,8,N
+67,06_PoseZcomp,FzYawDeadDyn_N,MAIN.FzYawDeadDyn_N,LREAL,REAL64,8,N
+68,06_PoseZcomp,FzYaw_work_N,MAIN.FzYaw_work_N,LREAL,REAL64,8,N
+69,06_PoseZcomp,AF_Vcmd_enc_s,MAIN.AF_Vcmd_enc_s,LREAL,REAL64,8,deg/s
+70,06_PoseZcomp,Yaw_Vcmd_enc_s,MAIN.Yaw_Vcmd_enc_s,LREAL,REAL64,8,deg/s
+71,07_Interlocks,bForceMode,MAIN.bForceMode,BOOL,BIT,1,bool
+72,07_Interlocks,bRunForce,MAIN.bRunForce,BOOL,BIT,1,bool
+73,07_Interlocks,bAxesReadyForForce,MAIN.bAxesReadyForForce,BOOL,BIT,1,bool
+74,07_Interlocks,bEStopActive,MAIN.bEStopActive,BOOL,BIT,1,bool
+75,07_Interlocks,Axis1_BrakeMotionOK,MAIN.Axis1_BrakeMotionOK,BOOL,BIT,1,bool
+76,07_Interlocks,bZeroDone,MAIN.bZeroDone,BOOL,BIT,1,bool
+77,07_Interlocks,bExtBD,MAIN.bExtBD,BOOL,BIT,1,bool
+78,07_Interlocks,bExtAC,MAIN.bExtAC,BOOL,BIT,1,bool
+79,07_Interlocks,bValidJ,MAIN.bValidJ,BOOL,BIT,1,bool
+80,07_Interlocks,bForceSoftLimit,MAIN.bForceSoftLimit,BOOL,BIT,1,bool
+81,07_Interlocks,StopReasonCode,MAIN.StopReasonCode,INT,INT16,2,code
+82,07_Interlocks,bZeroRise,MAIN.bZeroRise,BOOL,BIT,1,bool
+83,07_Interlocks,bForceRise,MAIN.bForceRise,BOOL,BIT,1,bool
+84,08_Parameters,FIntentEnter_X_N,MAIN.FIntentEnter_X_N,LREAL,REAL64,8,N
+85,08_Parameters,FIntentEnter_Z_N,MAIN.FIntentEnter_Z_N,LREAL,REAL64,8,N
+86,08_Parameters,FIntentExit_X_N,MAIN.FIntentExit_X_N,LREAL,REAL64,8,N
+87,08_Parameters,FIntentExit_Z_N,MAIN.FIntentExit_Z_N,LREAL,REAL64,8,N
+88,08_Parameters,FDeadSubUse_X_N,MAIN.FDeadSubUse_X_N,LREAL,REAL64,8,N
+89,08_Parameters,FDeadSubUse_Z_N,MAIN.FDeadSubUse_Z_N,LREAL,REAL64,8,N
+90,08_Parameters,ForceGain_X,MAIN.ForceGain_X,LREAL,REAL64,8,ratio
+91,08_Parameters,ForceGain_Z,MAIN.ForceGain_Z,LREAL,REAL64,8,ratio
+92,08_Parameters,AdmM_X,MAIN.AdmM_X,LREAL,REAL64,8,virtual mass
+93,08_Parameters,AdmM_Z,MAIN.AdmM_Z,LREAL,REAL64,8,virtual mass
+94,08_Parameters,AdmB_Stop_X,MAIN.AdmB_Stop_X,LREAL,REAL64,8,virtual damping
+95,08_Parameters,AdmB_Stop_Z,MAIN.AdmB_Stop_Z,LREAL,REAL64,8,virtual damping
+96,08_Parameters,Alpha,MAIN.Alpha,LREAL,REAL64,8,ratio
+97,08_Parameters,Ts,MAIN.Ts,LREAL,REAL64,8,s

@@ -1,0 +1,44 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.15">
+  <POU Name="F_CEHI_CandidateAllow" Id="{ee826d0b-5b0b-4aeb-a7f1-4c85c5d8d2ab}" SpecialFunc="None">
+    <Declaration><![CDATA[// =============================================================
+// FUNCTION：F_CEHI_CandidateAllow
+// 逐方向预测放行逻辑。
+// =============================================================
+FUNCTION F_CEHI_CandidateAllow : BOOL
+VAR_INPUT
+    CurrentValid   : BOOL;
+    CurrentDis_m   : LREAL;
+    CandidateDis_m : LREAL;
+    MinSafe_m      : LREAL;
+    ImproveEps_m   : LREAL;
+END_VAR]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[
+
+F_CEHI_CandidateAllow := FALSE;
+
+IF CandidateDis_m <= 0.0 THEN
+    RETURN;
+END_IF;
+
+IF CurrentValid THEN
+    IF CurrentDis_m < MinSafe_m THEN
+        // 已经小于安全边界：只允许让距离增大的方向。
+        F_CEHI_CandidateAllow := CandidateDis_m > (CurrentDis_m + ImproveEps_m);
+    ELSE
+        // 尚未越界：允许在安全边界以上运动，包括距离变小但不越界。
+        F_CEHI_CandidateAllow := CandidateDis_m >= MinSafe_m;
+    END_IF;
+ELSE
+    // 当前几何无效：只允许候选回到安全边界以上。
+    F_CEHI_CandidateAllow := CandidateDis_m >= MinSafe_m;
+END_IF;
+]]></ST>
+    </Implementation>
+    <LineIds Name="F_CEHI_CandidateAllow">
+      <LineId Id="44" Count="19" />
+      <LineId Id="7" Count="0" />
+    </LineIds>
+  </POU>
+</TcPlcObject>

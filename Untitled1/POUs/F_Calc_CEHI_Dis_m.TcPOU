@@ -1,0 +1,185 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.15">
+  <POU Name="F_Calc_CEHI_Dis_m" Id="{6cc0c5bd-4136-4441-b9c3-990e834cd2da}" SpecialFunc="None">
+    <Declaration><![CDATA[// =============================================================
+// FUNCTION：F_Calc_CEHI_Dis_m
+// 与 FB_Calc_CEHI_Geo 同一模型，但只返回 H/I 到 CE 的平均距离。
+// 返回 -1.0 表示几何无效。
+// =============================================================
+FUNCTION F_Calc_CEHI_Dis_m : LREAL
+VAR_INPUT
+    BD_Enc_mm             : LREAL;
+    AC_Enc_deg            : LREAL;
+    AF_Enc_deg            : LREAL;
+
+    BD_KinOffset_mm       : LREAL;
+
+    AC_EncRef_deg         : LREAL;
+    AC_ThetaRef_deg       : LREAL;
+
+    Ax0                   : LREAL;
+    Az0                   : LREAL;
+    Bx0                   : LREAL;
+    Bz0                   : LREAL;
+
+    l_AC_m                : LREAL;
+    l_CD_m                : LREAL;
+    l_CE_m                : LREAL;
+    qOffset_m             : LREAL;
+    l_CH_m                : LREAL;
+
+    BD_BRANCH             : LREAL;
+    CE_SIGN               : LREAL;
+
+    AF_HorizontalEnc_deg  : LREAL;
+    AF_CHOffset_deg       : LREAL;
+    AF_EncDir_CH          : LREAL;
+
+    GeoMargin_m           : LREAL;
+END_VAR
+VAR
+    LBD_m        : LREAL;
+
+    ThetaAC_deg  : LREAL;
+    ThetaAC_rad  : LREAL;
+
+    Cx_f         : LREAL;
+    Cz_f         : LREAL;
+    Dx_f         : LREAL;
+    Dz_f         : LREAL;
+    Ex_f         : LREAL;
+    Ez_f         : LREAL;
+    Hx_f         : LREAL;
+    Hz_f         : LREAL;
+    Ix_f         : LREAL;
+    Iz_f         : LREAL;
+
+    dxBC_f       : LREAL;
+    dzBC_f       : LREAL;
+    dBC_f        : LREAL;
+
+    alphaBC_f    : LREAL;
+    cosBeta_f    : LREAL;
+    beta_f       : LREAL;
+    thBD_f       : LREAL;
+
+    thetaCD_f    : LREAL;
+    thetaCE_f    : LREAL;
+
+    s_CD_CE_f    : LREAL;
+    gamma_DCE_f  : LREAL;
+
+    uCEx_f       : LREAL;
+    uCEz_f       : LREAL;
+    uCHx_f       : LREAL;
+    uCHz_f       : LREAL;
+
+    thetaCH_deg  : LREAL;
+    thetaAF_abs_deg : LREAL;
+    thetaCH_rad  : LREAL;
+
+    DisH_f       : LREAL;
+    DisI_f       : LREAL;
+
+    GCH_Matlab_deg : LREAL := 90.0;
+    DEG2RAD_local  : LREAL := 0.0174532925199433;
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[
+// 默认 -1 表示几何无效
+F_Calc_CEHI_Dis_m := -1.0;
+
+// BD 编码器 -> 实际机构长度
+LBD_m := (BD_Enc_mm + BD_KinOffset_mm) / 1000.0;
+
+// AC 编码器 -> AC 机构角
+ThetaAC_deg := AC_ThetaRef_deg - (AC_Enc_deg - AC_EncRef_deg);
+ThetaAC_rad := ThetaAC_deg * DEG2RAD_local;
+
+// C 点
+Cx_f := Ax0 + l_AC_m * COS(ThetaAC_rad);
+Cz_f := Az0 + l_AC_m * SIN(ThetaAC_rad);
+
+// B-C
+dxBC_f := Cx_f - Bx0;
+dzBC_f := Cz_f - Bz0;
+dBC_f  := SQRT(dxBC_f * dxBC_f + dzBC_f * dzBC_f);
+
+IF (LBD_m <= 0.01) OR (dBC_f <= 0.01) THEN
+    RETURN;
+END_IF;
+//三角形存在性判断
+IF NOT ((dBC_f < (LBD_m + l_CD_m - GeoMargin_m)) AND
+        (dBC_f > (ABS(LBD_m - l_CD_m) + GeoMargin_m))) THEN
+    RETURN;//理论边界预留安全余量
+END_IF;
+
+// 三角形 B-C-D求解
+alphaBC_f := F_Atan2_LREAL(y := dzBC_f, x := dxBC_f);
+
+cosBeta_f := (LBD_m * LBD_m + dBC_f * dBC_f - l_CD_m * l_CD_m)
+             / (2.0 * LBD_m * dBC_f);
+
+IF cosBeta_f > 1.0 THEN
+    cosBeta_f := 1.0;
+ELSIF cosBeta_f < -1.0 THEN
+    cosBeta_f := -1.0;
+END_IF;//数值鲁棒处理防止accos越界
+
+beta_f := ACOS(cosBeta_f);
+thBD_f := alphaBC_f + BD_BRANCH * beta_f;
+
+Dx_f := Bx0 + LBD_m * COS(thBD_f);
+Dz_f := Bz0 + LBD_m * SIN(thBD_f);
+
+thetaCD_f := F_Atan2_LREAL(y := Dz_f - Cz_f, x := Dx_f - Cx_f);
+
+// D 到 CE 的垂直偏置 qOffset_m
+IF l_CD_m <= ABS(qOffset_m) THEN
+    RETURN;
+END_IF;
+
+s_CD_CE_f   := SQRT(l_CD_m * l_CD_m - qOffset_m * qOffset_m);
+gamma_DCE_f := ATAN(qOffset_m / s_CD_CE_f);
+
+thetaCE_f := thetaCD_f + CE_SIGN * gamma_DCE_f;
+
+uCEx_f := COS(thetaCE_f);
+uCEz_f := SIN(thetaCE_f);
+
+Ex_f := Cx_f + l_CE_m * uCEx_f;
+Ez_f := Cz_f + l_CE_m * uCEz_f;
+
+// MATLAB 后级 H/I 方法,一致性，无实际意义
+thetaCH_deg := AF_EncDir_CH * (AF_Enc_deg - AF_HorizontalEnc_deg) + AF_CHOffset_deg;
+thetaAF_abs_deg := thetaCH_deg + GCH_Matlab_deg;
+thetaCH_deg := thetaAF_abs_deg - GCH_Matlab_deg;
+thetaCH_rad := thetaCH_deg * DEG2RAD_local;
+
+uCHx_f := COS(thetaCH_rad);
+uCHz_f := SIN(thetaCH_rad);
+
+Hx_f := Cx_f + l_CH_m * uCHx_f;
+Hz_f := Cz_f + l_CH_m * uCHz_f;
+
+Ix_f := Ex_f + (Hx_f - Cx_f);
+Iz_f := Ez_f + (Hz_f - Cz_f);
+
+DisH_f := ABS(
+    uCEx_f * (Hz_f - Cz_f) - uCEz_f * (Hx_f - Cx_f)
+);
+
+DisI_f := ABS(
+    uCEx_f * (Iz_f - Cz_f) - uCEz_f * (Ix_f - Cx_f)
+);
+
+F_Calc_CEHI_Dis_m := 0.5 * (DisH_f + DisI_f);
+]]></ST>
+    </Implementation>
+    <LineIds Name="F_Calc_CEHI_Dis_m">
+      <LineId Id="540" Count="88" />
+      <LineId Id="7" Count="0" />
+    </LineIds>
+  </POU>
+</TcPlcObject>

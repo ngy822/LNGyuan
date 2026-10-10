@@ -1,0 +1,299 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.15">
+  <POU Name="FB_Calc_CEHI_Geo" Id="{0602ffbb-7ef0-48b4-be0c-1fbd247dce9c}" SpecialFunc="None">
+    <Declaration><![CDATA[
+// =============================================================
+// FUNCTION_BLOCK：FB_Calc_CEHI_Geo
+// MATLAB 对应关系：
+//   res.F = A + l_AF*[cos(th_af); sin(th_af)]
+//   res.G = C + (res.F - A)
+//   th_CH = th_af - angle_GCH
+//   res.H = C + l_CH*[cos(th_CH); sin(th_CH)]
+//   res.I = E + (res.H - res.C)
+// 这里不显式输出 F/G，但按照同一逻辑构造 thetaAF_abs 与 thetaCH/EI。
+// =============================================================
+FUNCTION_BLOCK FB_Calc_CEHI_Geo
+VAR_INPUT
+    BD_Enc_mm             : LREAL;
+    AC_Enc_deg            : LREAL;
+    AF_Enc_deg            : LREAL;
+
+    BD_KinOffset_mm       : LREAL;
+
+    AC_EncRef_deg         : LREAL;
+    AC_ThetaRef_deg       : LREAL;
+
+    Ax0                   : LREAL;
+    Az0                   : LREAL;
+    Bx0                   : LREAL;
+    Bz0                   : LREAL;
+
+    l_AC_m                : LREAL;
+    l_CD_m                : LREAL;
+    l_CE_m                : LREAL;
+    qOffset_m             : LREAL;
+    l_CH_m                : LREAL;
+
+    BD_BRANCH             : LREAL;     // -1：thetaBD = alphaBC - beta；+1：thetaBD = alphaBC + beta
+    CE_SIGN               : LREAL;     // +1 / -1，D/q 偏置到 CE 方向的装配符号
+
+    AF_HorizontalEnc_deg  : LREAL;
+    AF_CHOffset_deg       : LREAL;     // AF=水平时 EI/CH 与 +X 的夹角，当前保持 MAIN 中最新值 15 deg
+    AF_EncDir_CH          : LREAL;     // 当前保持 MAIN 中最新值 -1：thetaEI = 205 - AF + offset
+
+    GeoMargin_m           : LREAL;
+END_VAR
+VAR_OUTPUT
+    Valid                 : BOOL;
+    ErrorID               : INT;
+
+    Cx                    : LREAL;
+    Cz                    : LREAL;
+    Dx                    : LREAL;
+    Dz                    : LREAL;
+    Qx                    : LREAL;
+    Qz                    : LREAL;
+    Ex                    : LREAL;
+    Ez                    : LREAL;
+
+    Hx                    : LREAL;
+    Hz                    : LREAL;
+    Ix                    : LREAL;
+    Iz                    : LREAL;
+
+    thetaCE_rad           : LREAL;
+    ThetaCH_rad           : LREAL;
+    ThetaCH_deg           : LREAL;
+    ThetaAF_abs_deg       : LREAL;     // 新增诊断：按 MATLAB th_af 含义得到的 AF 绝对角
+    DeltaCH_CE_deg        : LREAL;
+
+    uCEx                  : LREAL;
+    uCEz                  : LREAL;
+
+    CEHI_Dis_m            : LREAL;
+    CEHI_DisSigned_m      : LREAL;
+    DisFromH_m            : LREAL;
+    DisFromI_m            : LREAL;
+    DisFromHIAvg_m        : LREAL;
+    DisDiff_m             : LREAL;
+
+    CE_L_Check_m          : LREAL;
+    Q_Offset_Check_m      : LREAL;
+    CH_L_Check_m          : LREAL;
+    EI_L_Check_m          : LREAL;
+    HI_L_Check_m          : LREAL;
+    HI_ParallelErr_m      : LREAL;
+END_VAR
+VAR
+    LBD_m        : LREAL;
+
+    ThetaAC_deg  : LREAL;
+    ThetaAC_rad  : LREAL;
+
+    dxBC         : LREAL;
+    dzBC         : LREAL;
+    dBC          : LREAL;
+
+    alphaBC      : LREAL;
+    cosBeta      : LREAL;
+    beta         : LREAL;
+    thBD         : LREAL;
+
+    thetaCD      : LREAL;
+    s_CD_CE      : LREAL;
+    gamma_DCE    : LREAL;
+
+    uCHx         : LREAL;
+    uCHz         : LREAL;
+
+    // MATLAB 中 th_af - angle_GCH。这里 angle_GCH 取 90 度三角板关系，
+    // 因此 thetaCH = thetaAF_abs - 90 = thetaEI。
+    GCH_Matlab_deg : LREAL := 90.0;
+
+    DEG2RAD_local : LREAL := 0.0174532925199433;
+    RAD2DEG_local : LREAL := 57.29577951308232;
+END_VAR]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[
+
+// 默认无效
+Valid := FALSE;
+ErrorID := 0;
+
+Cx := 0.0; Cz := 0.0;
+Dx := 0.0; Dz := 0.0;
+Qx := 0.0; Qz := 0.0;
+Ex := 0.0; Ez := 0.0;
+Hx := 0.0; Hz := 0.0;
+Ix := 0.0; Iz := 0.0;
+
+thetaCE_rad := 0.0;
+ThetaCH_rad := 0.0;
+ThetaCH_deg := 0.0;
+ThetaAF_abs_deg := 0.0;
+DeltaCH_CE_deg := 0.0;
+
+uCEx := 1.0;
+uCEz := 0.0;
+
+CEHI_Dis_m := -1.0;
+CEHI_DisSigned_m := 0.0;
+DisFromH_m := -1.0;
+DisFromI_m := -1.0;
+DisFromHIAvg_m := -1.0;
+DisDiff_m := 0.0;
+
+CE_L_Check_m := 0.0;
+Q_Offset_Check_m := 0.0;
+CH_L_Check_m := 0.0;
+EI_L_Check_m := 0.0;
+HI_L_Check_m := 0.0;
+HI_ParallelErr_m := 0.0;
+
+// BD 编码器 -> 机构长度
+LBD_m := (BD_Enc_mm + BD_KinOffset_mm) / 1000.0;
+
+// AC 编码器 -> AC 机构角
+ThetaAC_deg := AC_ThetaRef_deg - (AC_Enc_deg - AC_EncRef_deg);
+ThetaAC_rad := ThetaAC_deg * DEG2RAD_local;
+
+// C 点
+Cx := Ax0 + l_AC_m * COS(ThetaAC_rad);
+Cz := Az0 + l_AC_m * SIN(ThetaAC_rad);
+
+// B-C
+dxBC := Cx - Bx0;
+dzBC := Cz - Bz0;
+dBC  := SQRT(dxBC * dxBC + dzBC * dzBC);
+
+IF (LBD_m <= 0.01) OR (dBC <= 0.01) THEN
+    ErrorID := 1;
+    RETURN;
+END_IF;
+
+IF NOT ((dBC < (LBD_m + l_CD_m - GeoMargin_m)) AND
+        (dBC > (ABS(LBD_m - l_CD_m) + GeoMargin_m))) THEN
+    ErrorID := 2;
+    RETURN;
+END_IF;
+
+// 三角形 B-C-D。这里保留 PLC 的 BD_BRANCH，用你的最新参数 -1。
+alphaBC := F_Atan2_LREAL(y := dzBC, x := dxBC);
+
+cosBeta := (LBD_m * LBD_m + dBC * dBC - l_CD_m * l_CD_m)
+           / (2.0 * LBD_m * dBC);
+
+IF cosBeta > 1.0 THEN
+    cosBeta := 1.0;
+ELSIF cosBeta < -1.0 THEN
+    cosBeta := -1.0;
+END_IF;
+
+beta := ACOS(cosBeta);
+thBD := alphaBC + BD_BRANCH * beta;
+
+Dx := Bx0 + LBD_m * COS(thBD);
+Dz := Bz0 + LBD_m * SIN(thBD);
+
+// CD 方向
+thetaCD := F_Atan2_LREAL(y := Dz - Cz, x := Dx - Cx);
+
+// D 到 CE 的垂直偏置 qOffset_m。MATLAB 原代码没有这一步，PLC 保留。
+IF l_CD_m <= ABS(qOffset_m) THEN
+    ErrorID := 3;
+    RETURN;
+END_IF;
+
+s_CD_CE := SQRT(l_CD_m * l_CD_m - qOffset_m * qOffset_m);
+gamma_DCE := ATAN(qOffset_m / s_CD_CE);
+
+thetaCE_rad := thetaCD + CE_SIGN * gamma_DCE;
+
+uCEx := COS(thetaCE_rad);
+uCEz := SIN(thetaCE_rad);
+
+// Q 点：D 到 CE 的垂足
+Qx := Cx + s_CD_CE * uCEx;
+Qz := Cz + s_CD_CE * uCEz;
+
+// CE 末端 E
+Ex := Cx + l_CE_m * uCEx;
+Ez := Cz + l_CE_m * uCEz;
+
+// =============================================================
+// 后级 H/I：按 MATLAB 机构方法写清楚
+// AF=水平时，EI/CH 与 +X 的夹角为 AF_CHOffset_deg。
+// AF 减小时，若 AF_EncDir_CH=-1，则 EI/CH 角度增大。
+// thetaAF_abs 只是诊断量；真正用于 H/I 的是 thetaCH = thetaAF_abs - 90。
+// =============================================================
+ThetaCH_deg := AF_EncDir_CH * (AF_Enc_deg - AF_HorizontalEnc_deg) + AF_CHOffset_deg;
+ThetaAF_abs_deg := ThetaCH_deg + GCH_Matlab_deg;
+ThetaCH_deg := ThetaAF_abs_deg - GCH_Matlab_deg;
+ThetaCH_rad := ThetaCH_deg * DEG2RAD_local;
+
+uCHx := COS(ThetaCH_rad);
+uCHz := SIN(ThetaCH_rad);
+
+// MATLAB：H = C + l_CH*[cos(th_CH), sin(th_CH)]
+Hx := Cx + l_CH_m * uCHx;
+Hz := Cz + l_CH_m * uCHz;
+
+// MATLAB：I = E + (H - C)，从而 HI 与 CE 平行
+Ix := Ex + (Hx - Cx);
+Iz := Ez + (Hz - Cz);
+
+// H/I 到 CE 直线的有符号距离。CE 直线以 C 为基点，方向 uCE。
+CEHI_DisSigned_m := uCEx * (Hz - Cz) - uCEz * (Hx - Cx);
+
+DisFromH_m := ABS(
+    uCEx * (Hz - Cz) - uCEz * (Hx - Cx)
+);
+
+DisFromI_m := ABS(
+    uCEx * (Iz - Cz) - uCEz * (Ix - Cx)
+);
+
+DisFromHIAvg_m := 0.5 * (DisFromH_m + DisFromI_m);
+CEHI_Dis_m := DisFromHIAvg_m;
+DisDiff_m := DisFromH_m - DisFromI_m;
+
+DeltaCH_CE_deg := F_Norm180(Ang_deg := (ThetaCH_rad - thetaCE_rad) * RAD2DEG_local);
+
+// 检查量
+CE_L_Check_m := SQRT((Ex - Cx) * (Ex - Cx) + (Ez - Cz) * (Ez - Cz));
+
+Q_Offset_Check_m := SQRT(
+    (Dx - Qx) * (Dx - Qx) +
+    (Dz - Qz) * (Dz - Qz)
+);
+
+CH_L_Check_m := SQRT(
+    (Hx - Cx) * (Hx - Cx) +
+    (Hz - Cz) * (Hz - Cz)
+);
+
+EI_L_Check_m := SQRT(
+    (Ix - Ex) * (Ix - Ex) +
+    (Iz - Ez) * (Iz - Ez)
+);
+
+HI_L_Check_m := SQRT(
+    (Ix - Hx) * (Ix - Hx) +
+    (Iz - Hz) * (Iz - Hz)
+);
+
+HI_ParallelErr_m := SQRT(
+    ((Ix - Hx) - (Ex - Cx)) * ((Ix - Hx) - (Ex - Cx)) +
+    ((Iz - Hz) - (Ez - Cz)) * ((Iz - Hz) - (Ez - Cz))
+);
+
+Valid := TRUE;
+ErrorID := 0;
+]]></ST>
+    </Implementation>
+    <LineIds Name="FB_Calc_CEHI_Geo">
+      <LineId Id="501" Count="174" />
+      <LineId Id="9" Count="0" />
+    </LineIds>
+  </POU>
+</TcPlcObject>

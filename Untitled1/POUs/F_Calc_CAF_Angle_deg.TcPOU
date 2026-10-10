@@ -1,0 +1,48 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.15">
+  <POU Name="F_Calc_CAF_Angle_deg" Id="{7f78d160-a34f-4f46-90a6-ca7feea1b1e4}" SpecialFunc="None">
+    <Declaration><![CDATA[// =============================================================
+// FUNCTION：F_Calc_CAF_Angle_deg
+// =============================================================
+FUNCTION F_Calc_CAF_Angle_deg : LREAL
+VAR_INPUT
+    AC_Enc_deg             : LREAL;
+    AF_Enc_deg             : LREAL;
+
+    AC_EncRef_deg          : LREAL;
+    AC_ThetaRef_deg        : LREAL;
+
+    AF_HorizontalEnc_deg   : LREAL;
+    GCH_Angle_deg          : LREAL;
+    AF_EndOffset_deg       : LREAL;
+END_VAR
+VAR
+    ThetaAC_deg       : LREAL;
+    AF_ToolPitch_deg  : LREAL;
+    AF_True_deg       : LREAL;
+    diff_deg          : LREAL;
+END_VAR]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[
+
+// AC 编码器 -> AC 真实机构角
+ThetaAC_deg := AC_ThetaRef_deg - (AC_Enc_deg - AC_EncRef_deg);
+
+// AF 编码器 -> 末端相对水平角。AF=205 水平时为 0。
+AF_ToolPitch_deg := AF_HorizontalEnc_deg - AF_Enc_deg;
+
+// AF 真实角度 = ToolPitch + ∠GCH + 末端偏置
+AF_True_deg := AF_ToolPitch_deg + GCH_Angle_deg + AF_EndOffset_deg;
+
+// ∠CAF
+diff_deg := F_Norm180(Ang_deg := AF_True_deg - ThetaAC_deg);
+
+F_Calc_CAF_Angle_deg := ABS(diff_deg);
+]]></ST>
+    </Implementation>
+    <LineIds Name="F_Calc_CAF_Angle_deg">
+      <LineId Id="132" Count="14" />
+      <LineId Id="7" Count="0" />
+    </LineIds>
+  </POU>
+</TcPlcObject>
